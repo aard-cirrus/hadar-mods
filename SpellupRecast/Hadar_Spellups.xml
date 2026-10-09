@@ -11,7 +11,7 @@
    save_state="y"
    date_written="2021-12-31 00:00:00"
    requires="4.00"
-   version="1.19"
+   version="1.20"
    >
 
 </plugin>
@@ -574,6 +574,9 @@ function OnPluginBroadcast(msg, id, name, text)
 				rsStateCheck()
 			end
 		end
+		if (text == "char.base") then
+			rsRaceAuto()
+		end
 		if (text == "char.vitals") then
 			currentmana = tonumber(gmcp("char.vitals.mana"))
 			if type(currentmana) ~= "number" then
@@ -911,6 +914,7 @@ function injectVars()
 	v["GL"]["spriteinvis_autocast"] = "no"
 	v["GL"]["spriteinvis_pending"] = false
 	v["GL"]["spriteinvis_suspended"] = false
+	v["GL"]["spriteinvis_userset"] = false -- the user picked on/off themselves; auto stops deciding
 	v["GL"]["desecration_autocast"] = "no"
 	v["GL"]["desecration_pending"] = false
 	-- Sanctuary/aura swap state machine. "off" = float item worn and the sanctuary
@@ -1341,6 +1345,7 @@ function affon(name, line, wc)
 			Spellups["GL"][r.pending] = false
 			Spellups["GL"][r.key.."_suspended"] = false
 			r.blockedRoom = nil
+			r.healat = nil -- it landed: the answer RS_WAIT was waiting for
 		end
 	end
 	if sn == 71 and Spellups["GL"]["aurastate"] ~= "worn" then
@@ -2281,6 +2286,8 @@ end
 -- yieldWhenOff = while the toggle is off the normal spellup path owns the skill.
 --                Without it the tracker owns the skill even when off.
 -- suspendOnVis = the vis alias pauses it until the effect comes back.
+-- autoOnRace = the race decides: on by itself when the race gate matches (unless the
+--              user chose with the command - remembered), off for any other race.
 -- Skill numbers and recovery groups are resolved from slist at runtime rather than
 -- hardcoded, so this works on any character without a lookup table.
 recoverySkills = {
@@ -2295,7 +2302,7 @@ recoverySkills = {
 		suspendOnVis = true,
 		setting = "shadow_autocast",    pending = "shadow_pending"},
 	{key = "spriteinvis", skill = "invis", cmd = "invis", label = "Sprite invis", race = "Sprite",
-		noPrac = true, fallbackSn = 58, yieldWhenOff = true, suspendOnVis = true,
+		noPrac = true, fallbackSn = 58, yieldWhenOff = true, suspendOnVis = true, autoOnRace = true,
 		setting = "spriteinvis_autocast", pending = "spriteinvis_pending"},
 	{key = "desecration", skill = "desecration", cmd = "cast desecration", label = "Desecration",
 		class = "Harmer",
@@ -2549,8 +2556,38 @@ function rsLoginCheckOne(r)
 end
 
 function rsLoginCheck()
+	rsRaceAuto()
 	for _,r in ipairs(recoverySkills) do
 		rsLoginCheckOne(r)
+	end
+end
+
+-- The race decides, both ways, as soon as GMCP reports it. A Sprite's racial invis
+-- comes back on its own in game and cannot be turned off there, so the plugin keeps it
+-- up without being asked; an explicit on/off from a Sprite is remembered and wins.
+-- Any other race turns it off and forgets that choice, so remorting back to Sprite
+-- starts from auto again.
+function rsRaceAuto()
+	if Spellups == nil or Spellups["GL"] == nil then return end
+	local race = gmcp("char.base.race")
+	if type(race) ~= "string" or race == "" then return end
+	for _,r in ipairs(recoverySkills) do
+		if r.autoOnRace and r.race ~= nil then
+			if string.lower(race) == string.lower(r.race) then
+				if Spellups["GL"][r.key.."_userset"] ~= true and Spellups["GL"][r.setting] ~= "yes" then
+					Spellups["GL"][r.setting] = "yes"
+					Spellups["GL"][r.key.."_suspended"] = false
+					hadarprint(r.race.." detected: "..r.label.." auto-recast is @GON@c (@Ghsp "..r.key.." off@c to stop)","script")
+				end
+			else
+				Spellups["GL"][r.key.."_userset"] = false
+				if Spellups["GL"][r.setting] == "yes" then
+					Spellups["GL"][r.setting] = "no"
+					Spellups["GL"][r.pending] = false
+					hadarprint("Not a "..r.race.." ("..race.."): "..r.label.." auto-recast is @ROFF","script")
+				end
+			end
+		end
 	end
 end
 
@@ -2565,6 +2602,10 @@ function rsToggle(key, str)
 	local r = rsFind(key)
 	if r == nil then return end
 	local arg = string.lower(str or "")
+
+	if (arg == "on" or arg == "off") and r.autoOnRace then
+		Spellups["GL"][r.key.."_userset"] = true
+	end
 
 	if arg == "on" then
 		if not rsClassCheck(r) then return end
@@ -3027,6 +3068,9 @@ function hspDiag()
 		end
 		if r.suspendOnVis then
 			hspDiagLine("paused by vis     ", Spellups["GL"][r.key.."_suspended"])
+		end
+		if r.autoOnRace then
+			hspDiagLine("chosen by you     ", Spellups["GL"][r.key.."_userset"] == true)
 		end
 		if r.key == "desecration" then
 			hspDiagLine("forgetspell wrap  ", hspWrapState or "idle")
@@ -4488,10 +4532,10 @@ function HadarHelp(str)
 		hadarprint("@x086+----------------------------------------------------------------------+@w","helpfile2")
 	elseif arg == "spriteinvis" or arg == "sprite" then
 		hadarprint("@x086+-------------------------@G[@CS@cprite @CI@cnvis @CH@celp@G]@x086--------------------------+@w","helpfile2")
-		hadarprint("@x086| @x214hsp spriteinvis        Shows current auto-invis status               @x086|","helpfile2")
+		hadarprint("@x086| @x214hsp spriteinvis        Status. On by itself for Sprites              @x086|","helpfile2")
 		hadarprint("@x086| @x208hsp spriteinvis on     Keeps racial invis up, reuses it whenever     @x086|","helpfile2")
 		hadarprint("@x086| @x208                       it drops (standing, not in a fight)           @x086|","helpfile2")
-		hadarprint("@x086| @x214hsp spriteinvis off    Stops; invis is then cast like a normal spell @x086|","helpfile2")
+		hadarprint("@x086| @x214hsp spriteinvis off    Stops it (remembered across logins)           @x086|","helpfile2")
 		hadarprint("@x086| @x208hsp sprite on|off      Same as hsp spriteinvis on|off                @x086|","helpfile2")
 		hadarprint("@x086| @x214                                                                     @x086|","helpfile2")
 		hadarprint("@x086| @x208Sprites only, no practice needed. Typing vis pauses it until         @x086|","helpfile2")
@@ -4545,7 +4589,7 @@ function HadarHelp(str)
 		hadarprint("@x086| @x208hsp stealth on|off       @x110- @x208Auto-recast stealth (Ninja)                  @x086|@w","helpfile")
 		hadarprint("@x086| @x214hsp stalk on|off         @x110- @x214Auto-recast stalk (Ninja)                    @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp shadow on|off        @x110- @x208Auto-recast shadow form (if learned)         @x086|@w","helpfile")
-		hadarprint("@x086| @x214hsp spriteinvis on|off   @x110- @x214Keep racial invis up (Sprite)                @x086|@w","helpfile")
+		hadarprint("@x086| @x214hsp spriteinvis on|off   @x110- @x214Racial invis upkeep (auto for Sprites)       @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp desecration on|off   @x110- @x208Keep desecration up (Harmer)                 @x086|@w","helpfile")
 		hadarprint("@x086| @x214dese                     @x110- @x214Toggle hsp desecration on/off                @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp autoaura <command>   @x110- @x208Has multiple commands, they are:             @x086|@w","helpfile")
