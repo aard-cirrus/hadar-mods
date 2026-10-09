@@ -11,7 +11,7 @@
    save_state="y"
    date_written="2021-12-31 00:00:00"
    requires="4.00"
-   version="1.18"
+   version="1.19"
    >
 
 </plugin>
@@ -132,7 +132,7 @@
      name="affon"
      group="SpellupTags"
      enabled="y"
-     match="^\{affon\}(?<sn>[0-9]{1,3}),(?<time>[0-9]{1,5})"
+     match="^\{affon\}(?<sn>[0-9]{1,3}),(?<time>-?[0-9]{1,5})"
      regexp="y"
      omit_from_output="y"
      sequence="100"
@@ -162,6 +162,45 @@
      keep_evaluating="y"
      sequence="100"
      script="shadowAlreadyUp"
+>
+</trigger>
+<!-- Sprite racial invis: the mud saying invis is already up means our tracking missed
+     it. {affon} for a permanent effect carries a negative time, handled in affon. -->
+<trigger
+     name="spriteInvisAlreadyUp"
+     enabled="y"
+     match="^You are already invisible\.$"
+     regexp="y"
+     keep_evaluating="y"
+     sequence="100"
+     script="spriteInvisAlreadyUp"
+>
+</trigger>
+<!-- Transient gag for the forgetspell wrap around a server-side spellup (see
+     hspMudsideSpellup). The group is only ever enabled for the few seconds between the
+     plugin sending "forgetspell desecration" and the reply, so a manual forgetspell is
+     never hidden. It is forced off on install/connect/disconnect and by a 5 second
+     timeout, so an unanswered probe cannot leave it gagging. -->
+<trigger
+     name="HSPdeseAdded"
+     group="HSPdeseWrap"
+     enabled="n"
+     match="^Added Desecration to your ignored skills\.$"
+     regexp="y"
+     omit_from_output="y"
+     sequence="100"
+     script="hspDeseAdded"
+>
+</trigger>
+<trigger
+     name="HSPdeseRemoved"
+     group="HSPdeseWrap"
+     enabled="n"
+     match="^Removed Desecration from your ignored skills\.$"
+     regexp="y"
+     omit_from_output="y"
+     sequence="100"
+     script="hspDeseRemoved"
 >
 </trigger>
 <trigger
@@ -366,6 +405,15 @@ sequence="100"
 		ignore_case="y"
 	>
 	</alias>
+	<alias
+		match="^dese$"
+		regexp="y"
+		ignore_case="y"
+		enabled="y"
+		sequence="100"
+		script="hspDeseToggle"
+	>
+	</alias>
 
 </aliases>
 
@@ -521,6 +569,10 @@ function OnPluginBroadcast(msg, id, name, text)
 			if table.count(Spellups["QS"]) > 0 then
 				cast_spells()
 			end
+			-- Moving out of a nocast room is what unblocks a tracked skill.
+			if currentState == 3 then
+				rsStateCheck()
+			end
 		end
 		if (text == "char.vitals") then
 			currentmana = tonumber(gmcp("char.vitals.mana"))
@@ -563,6 +615,17 @@ end -- function OnPluginSaveState
 
 
 function OnPluginInstall ()
+	-- These are only ever on for the length of one capture/wrap, but save_state persists
+	-- the enabled flag, so an interrupted one would come back on at the next load. Force
+	-- them off before OnPluginEnable, which may start a fresh slist capture.
+	EnableTriggerGroup("HSPslistCapture", false)
+	EnableTriggerGroup("HSPdeseWrap", false)
+	EnableTrigger("HSPRecoveriesStart", false)
+	EnableTrigger("HSPRecoveriesCapture", false)
+	EnableTrigger("HSPRecoveriesEnd", false)
+	-- slistCommandSent starts false every time the script loads, so it needs no reset here
+	-- (and clearing it would let OnPluginEnable re-open the slist capture just closed).
+	hspWrapState = nil
    	if GetVariable ("enabled") == "false" then
 		ColourNote ("yellow", "", "Warning: Plugin " .. GetPluginName ().. " is currently disabled.")
 		check (EnablePlugin(GetPluginID (), false))
@@ -572,6 +635,33 @@ function OnPluginInstall ()
 	hadarprint("had help (to see all of hadar's plugin helpfiles), or hsp help to just see this one","script")
   
 	OnPluginEnable ()
+end
+
+-- A capture or wrap cut off by a disconnect would never see its end marker.
+function OnPluginConnect ()
+	EnableTriggerGroup("HSPslistCapture", false)
+	EnableTriggerGroup("HSPdeseWrap", false)
+	EnableTrigger("HSPRecoveriesStart", false)
+	EnableTrigger("HSPRecoveriesCapture", false)
+	EnableTrigger("HSPRecoveriesEnd", false)
+	slistCommandSent = false
+	hspWrapState = nil
+	-- A fresh login resumes tracking: nothing paused by vis last session still applies.
+	if Spellups ~= nil and Spellups["GL"] ~= nil then
+		for _,r in ipairs(recoverySkills) do
+			Spellups["GL"][r.key.."_suspended"] = false
+		end
+	end
+end
+
+function OnPluginDisconnect ()
+	EnableTriggerGroup("HSPslistCapture", false)
+	EnableTriggerGroup("HSPdeseWrap", false)
+	EnableTrigger("HSPRecoveriesStart", false)
+	EnableTrigger("HSPRecoveriesCapture", false)
+	EnableTrigger("HSPRecoveriesEnd", false)
+	slistCommandSent = false
+	hspWrapState = nil
 end
 
 function OnPluginEnable ()
@@ -603,7 +693,7 @@ function OnPluginEnable ()
 	-- the following lines need to be in onpluginenable to recheck stuff and set current state for buildslist
 	
 	charstatus = gmcp("char.status") -- fetch char.status and return it as a Lua table
-    currentState = tonumber(charstatus.state)
+    currentState = tonumber(type(charstatus) == "table" and charstatus.state or nil) or -1
 	maxmana = tonumber(gmcp("char.maxstats.maxmana")) or -1
 	currentmana = tonumber(gmcp("char.vitals.mana")) or -1
 	
@@ -619,7 +709,11 @@ function OnPluginEnable ()
 	for _,r in ipairs(recoverySkills) do
 		Spellups["GL"][r.pending] = false
 		r.sn = nil -- force a fresh namelist lookup
+		r.healat = nil
+		r.blockedRoom = nil
 	end
+	-- Always checking: a missed {affoff} or a blocked attempt is retried from here.
+	AddTimer("HSPrsTick", 0, 0, 10, "", timer_flag.Enabled + timer_flag.Replace + timer_flag.Temporary, "hspRsTick")
 	Spellups["AF"]["list"][601] = nil
 	-- A saved "restoring" would block every future restore attempt. If sanctuary was
 	-- down when we last saved, assume the aura is still on us and re-arm the restore
@@ -813,6 +907,12 @@ function injectVars()
 	v["GL"]["stalk_autocast"] = "no"
 	v["GL"]["shadow_pending"] = false
 	v["GL"]["shadow_autocast"] = "no"
+	v["GL"]["shadow_suspended"] = false
+	v["GL"]["spriteinvis_autocast"] = "no"
+	v["GL"]["spriteinvis_pending"] = false
+	v["GL"]["spriteinvis_suspended"] = false
+	v["GL"]["desecration_autocast"] = "no"
+	v["GL"]["desecration_pending"] = false
 	-- Sanctuary/aura swap state machine. "off" = float item worn and the sanctuary
 	-- spell is up. "worn" = aura is on and covering us. "restoring" = aura removed
 	-- and a recast is in flight. See sancWearAura/sancTryRestore.
@@ -1165,8 +1265,10 @@ function HSPmain(name, line, wc)
 		hspdiedtoggle(rest)
 	elseif first == "eye" then
 		hspEyeStuff(rest)
-	elseif first == "quickstab" or first == "stealth" or first == "stalk" or first == "shadow" then
+	elseif first == "quickstab" or first == "stealth" or first == "stalk" or first == "shadow" or first == "desecration" then
 		rsToggle(first, rest)
+	elseif first == "spriteinvis" or first == "sprite" then
+		rsToggle("spriteinvis", rest)
 	elseif first == "refresh" then
 		hspRefresh()
 	elseif first == "diag" or first == "diagnostics" then
@@ -1218,17 +1320,27 @@ function affon(name, line, wc)
 		return
 	end
 	
-	if contains(Spellups["EX"]["Timer"],sn) then
+	-- A permanent effect (time <= 0, now accepted by the trigger) has no fall-off to
+	-- warn about, and recoveryup would schedule its warnings in the past.
+	if contains(Spellups["EX"]["Timer"],sn) and tm > 0 then
 		hadarprint("fired on lookup for timer","debug")
 		recoveryup(sn,tm)
 	end
 	
 	Spellups["AF"]["list"][sn] = tm
-	Spellups["AF"]["expires"][sn] = os.time() + tm
+	if tm > 0 then
+		Spellups["AF"]["expires"][sn] = os.time() + tm
+	else
+		-- A zero or negative time is a permanent effect (racial invis): no timer, only
+		-- {affoff} ends it.
+		Spellups["AF"]["expires"][sn] = nil
+	end
 	Spellups["NA"][sn] = 0 --not affected false
 	for _,r in ipairs(recoverySkills) do
 		if rsSn(r) == sn then
 			Spellups["GL"][r.pending] = false
+			Spellups["GL"][r.key.."_suspended"] = false
+			r.blockedRoom = nil
 		end
 	end
 	if sn == 71 and Spellups["GL"]["aurastate"] ~= "worn" then
@@ -1281,27 +1393,34 @@ function affoff(name,line,wc)
 		end --end for loop
 	end
 
-	-- Recovery-tracked skills are owned entirely here, so the toggle is the only
-	-- authority on whether they come back. Return so the normal queueing below never
-	-- recasts them behind the toggle's back.
+	-- Tracked skills are owned here, never queued: QS would send them as a plain cast
+	-- (invis would become "cast 'invis'"). rsTry is the single place they are used.
 	for _,r in ipairs(recoverySkills) do
 		if rsSn(r) == sn then
 			if not rsEnabled(r) then
+				if r.yieldWhenOff then
+					-- Off means the normal spellup path looks after it (casters' invis).
+					break
+				end
 				Spellups["QS"][sn] = nil
 				Spellups["GL"][r.pending] = false
 				hadarprint(r.skill.." fell off but auto-recast is off, leaving it","debug")
 				return
 			end
+			if rsSuspended(r) then
+				Spellups["QS"][sn] = nil
+				Spellups["GL"][r.pending] = false
+				hadarprint(r.skill.." fell off but is paused, leaving it","debug")
+				return
+			end
+			Spellups["QS"][sn] = nil
 			local rc = rsRc(r)
 			if rc ~= nil and hspRecoveryActive(rc) then
 				-- Cooldown still running (the case quickstab exists for): defer to recoff.
 				Spellups["GL"][r.pending] = true
 				hadarprint(r.skill.." fell off, flagged for recast when recovery clears","debug")
 			else
-				-- No active cooldown, so recast straight away like any normal buff.
-				Spellups["QS"][sn] = Spellups["AS"]["list"][sn]["name"]
-				hadarprint(r.skill.." fell off, recovery clear, queueing now","debug")
-				cast_spells()
+				rsTry(r, "fell off")
 			end
 			return
 		end
@@ -1441,6 +1560,34 @@ function sfail(name,line,wc)
 		return
 	end
 
+	-- Tracked skills never take the generic paths below. The mud's answer decides what
+	-- rsTry may do next.
+	local tr = rsOwner(sn)
+	if tr ~= nil then
+		Spellups["QS"][sn] = nil
+		tr.healat = 0 -- we have our answer, a retry is allowed
+		if fl == 2 then
+			rsMarkUp(tr)
+		elseif fl == 3 then
+			Spellups["GL"][tr.pending] = true
+			hadarprint(tr.skill.." blocked by recovery, will recast when recovery clears","debug")
+		elseif fl == 10 then
+			Spellups["GL"]["castholduntil"] = os.time() + 3
+			Spellups["GL"][tr.pending] = true
+			hadarprint("mud says we are resting, holding casts until state settles","debug")
+		elseif fl == 5 or fl == 11 then
+			Spellups["GL"][tr.pending] = true
+			tr.blockedRoom = gmcp("room.info.num")
+			hadarprint(tr.skill.." blocked here (fl="..fl.."), waiting until we change rooms","debug")
+		elseif fl == 1 then
+			rsTry(tr, "lost concentration")
+		else
+			Spellups["GL"][tr.pending] = true
+			hadarprint(tr.skill.." failed (fl="..fl.."), will retry","debug")
+		end
+		return
+	end
+
 	-- "You already have that". The mud is telling us the buff IS up and our own
 	-- tracking disagreed - common right after a relog, where affects we already had
 	-- were never announced to us. Record it, or the self heal retries forever.
@@ -1487,17 +1634,11 @@ function sfail(name,line,wc)
 		end
 	end
 
-    if fl == 3 then
-        Spellups["QS"][sn] = nil
-        for _,r in ipairs(recoverySkills) do
-            if rsSn(r) == sn and rsEnabled(r) then
-                Spellups["GL"][r.pending] = true
-                hadarprint(r.skill.." blocked by recovery, will recast when recovery clears","debug")
-            end
-        end
-        return
-    end
-	
+	if fl == 3 then
+		Spellups["QS"][sn] = nil
+		return
+	end
+
 	if fl == 1 or fl == 6 then
 		hadarprint("FL 1 or 6!","debug")
 		if sn == 414 then -- check if party sanctuary failed we are going to just do the recast here
@@ -1518,22 +1659,6 @@ function sfail(name,line,wc)
 			hadarprint("failed and found in spellup","debug")
 		end
 		cast_spells()
-	end
-
-	-- Catch-all: any other failure on a tracked skill must not leave it forgotten.
-	for _,r in ipairs(recoverySkills) do
-		if rsSn(r) == sn and rsEnabled(r) then
-			if not hspAffectActive(sn) then
-				local rc = rsRc(r)
-				if rc ~= nil and hspRecoveryActive(rc) then
-					Spellups["GL"][r.pending] = true
-					hadarprint(r.skill.." failed (fl="..fl.."), recovery active, will recast when ready","debug")
-				elseif Spellups["QS"][sn] == nil then
-					Spellups["QS"][sn] = Spellups["AS"]["list"][sn]["name"]
-					hadarprint(r.skill.." failed (fl="..fl.."), requeuing","debug")
-				end
-			end
-		end
 	end
 end
 
@@ -1574,7 +1699,7 @@ function cast_spells()
 			hadarprint("unknown spell "..i.." in queue, removing","debug")
 			Spellups["QS"][i] = nil
 		elseif rsIsSuppressed(i) then
-			hadarprint(Spellups["AS"]["list"][i]["name"].." auto-recast is off, removing from queue","debug")
+			hadarprint(Spellups["AS"]["list"][i]["name"].." is handled by the tracker, removing from queue","debug")
 			Spellups["QS"][i] = nil
 		else
         local ctype = tonumber(Spellups["AS"]["list"][i]["type"])
@@ -1609,7 +1734,7 @@ function cast_spells()
 						hadarprint("Contains V1 Cskill","debug")
 						cast_this(Spellups["EX"]["clanskillV1"],tonumber(Spellups["AS"]["list"][Spellups["EX"]["clanskillV1"]]["type"]))
 					end
-					SendNoEcho("spellup")
+					hspMudsideSpellup(false)
 					-- Deliberately NOT clearing the queue. {affon} removes each spell as
 					-- it lands, so whatever the server did not actually cast stays queued
 					-- instead of being wiped on the assumption that it worked.
@@ -1933,17 +2058,12 @@ end
 -- The mud telling us shadow form is already up. Record it so the self heal stops
 -- retrying; {affoff} clears it normally when it genuinely drops.
 function shadowAlreadyUp()
-	local r = rsFind("shadow")
-	if r == nil then return end
-	local sn = rsSn(r)
-	if sn == nil then return end
-	Spellups["QS"][sn] = nil
-	Spellups["GL"][r.pending] = false
-	if Spellups["AF"]["list"][sn] == nil then
-		Spellups["AF"]["list"][sn] = 1
-		Spellups["AF"]["expires"][sn] = nil
-		hadarprint("shadow form is already up, correcting our tracking","debug")
-	end
+	rsMarkUp(rsFind("shadow"))
+end
+
+-- Same for sprite racial invis.
+function spriteInvisAlreadyUp()
+	rsMarkUp(rsFind("spriteinvis"))
 end
 
 -- Backup for {affoff}71, which stays the primary signal. This only has to do anything
@@ -2148,10 +2268,19 @@ end
 -- tracks them itself. Those with a recovery cooldown that outlasts the buff cannot
 -- be recast at falloff (the cooldown is still running), so they carry a pending flag
 -- and wait for a nudge when the recovery clears. Those with no cooldown (shadow form)
--- are simply recast on the spot for 100% uptime - the rc == nil branches handle that.
+-- are simply recast on the spot for 100% uptime.
 --
--- skill    = the command to send to use it.
+-- Every use goes through rsTry, which sends r.cmd (never the slist type, so racial
+-- invis is "invis" and not "cast 'invis'") and waits RS_WAIT for the mud to answer.
+--
+-- skill    = the slist name unless resolve says otherwise.
+-- cmd      = the command to send, when it is not the skill name.
 -- resolve  = the slist name, only when it differs from the command.
+-- race     = race gate, like class. noPrac: a racial, usable without practice.
+-- fallbackSn = skill number to use when slist does not list the name.
+-- yieldWhenOff = while the toggle is off the normal spellup path owns the skill.
+--                Without it the tracker owns the skill even when off.
+-- suspendOnVis = the vis alias pauses it until the effect comes back.
 -- Skill numbers and recovery groups are resolved from slist at runtime rather than
 -- hardcoded, so this works on any character without a lookup table.
 recoverySkills = {
@@ -2163,8 +2292,18 @@ recoverySkills = {
 		setting = "stalk_autocast",     pending = "stalk_pending"},
 	{key = "shadow",    skill = "shadow",    label = "Shadow form",
 		resolve = "shadow form", -- no class: usable by anyone with the psi secondary
+		suspendOnVis = true,
 		setting = "shadow_autocast",    pending = "shadow_pending"},
+	{key = "spriteinvis", skill = "invis", cmd = "invis", label = "Sprite invis", race = "Sprite",
+		noPrac = true, fallbackSn = 58, yieldWhenOff = true, suspendOnVis = true,
+		setting = "spriteinvis_autocast", pending = "spriteinvis_pending"},
+	{key = "desecration", skill = "desecration", cmd = "cast desecration", label = "Desecration",
+		class = "Harmer",
+		setting = "desecration_autocast", pending = "desecration_pending"},
 }
+
+-- Seconds to wait for the mud to answer a tracked skill before trying it again.
+RS_WAIT = 10
 
 function rsFind(key)
 	for _,r in ipairs(recoverySkills) do
@@ -2202,7 +2341,8 @@ function rsSn(r)
 			end
 		end
 	end
-	if entry == nil then return nil end
+	-- Not cached, so a later slist can still supply the real number.
+	if entry == nil then return r.fallbackSn end
 	r.sn = tonumber(entry["skillnum"])
 	return r.sn
 end
@@ -2222,15 +2362,31 @@ function rsEnabled(r)
 	return Spellups["GL"][r.setting] == "yes"
 end
 
--- True if sn is a recovery-tracked skill whose auto-recast is currently off. Used to
--- keep the normal cast path from reviving a skill the user switched off.
-function rsIsSuppressed(sn)
+function rsSuspended(r)
+	return Spellups["GL"][r.key.."_suspended"] == true
+end
+
+-- Enabled and not paused by vis. Ownership uses rsEnabled, not this: a paused sprite
+-- invis must stay owned or the normal path would cast it.
+function rsActive(r)
+	return rsEnabled(r) and not rsSuspended(r)
+end
+
+-- The tracker entry that currently owns sn, or nil when the normal path may handle it.
+function rsOwner(sn)
+	if sn == nil then return nil end
 	for _,r in ipairs(recoverySkills) do
-		if rsSn(r) == sn then
-			return not rsEnabled(r)
+		if rsSn(r) == sn and (rsEnabled(r) or not r.yieldWhenOff) then
+			return r
 		end
 	end
-	return false
+	return nil
+end
+
+-- True if the tracker owns sn. The normal cast path must never cast such a skill: it
+-- would send the slist type's command, and it would revive a skill switched off.
+function rsIsSuppressed(sn)
+	return rsOwner(sn) ~= nil
 end
 
 -- Is sn one of the skills we manage? Such skills must reach the sfail handlers even
@@ -2246,6 +2402,7 @@ end
 function rsUsable(r)
 	local sn = rsSn(r)
 	if sn == nil then return false end
+	if r.noPrac then return true end
 	local entry = Spellups["AS"]["list"][sn]
 	if entry == nil then return false end
 	local prac = tonumber(entry["prac"])
@@ -2254,32 +2411,93 @@ function rsUsable(r)
 end
 
 function rsSend(r)
+	local cmd = r.cmd or r.skill
 	if Spellups["GL"]["seespells"] == "yes" then
-		Send(r.skill)
+		Send(cmd)
 	else
-		SendNoEcho(r.skill)
+		SendNoEcho(cmd)
 	end
+end
+
+-- The single place a tracked skill is used. Returns true when the command was sent.
+-- When it cannot go now the skill is left pending, and the state check / recoff / the
+-- periodic tick try again. healat holds off a second send until the mud has had RS_WAIT
+-- seconds to answer the first ({affon}, {sfail} or an "already" message).
+function rsTry(r, why)
+	if not rsActive(r) then
+		Spellups["GL"][r.pending] = false
+		return false
+	end
+	if Spellups["GL"]["disabled"] == "yes"
+		or currentState ~= 3
+		or os.time() < (tonumber(Spellups["GL"]["castholduntil"]) or 0)
+		or (r.blockedRoom ~= nil and r.blockedRoom == gmcp("room.info.num")) then
+		Spellups["GL"][r.pending] = true
+		return false
+	end
+	if os.time() < (tonumber(r.healat) or 0) then
+		Spellups["GL"][r.pending] = true
+		return false
+	end
+	r.healat = os.time() + RS_WAIT
+	Spellups["GL"][r.pending] = false
+	hadarprint(r.skill.." "..tostring(why)..", using it now","debug")
+	rsSend(r)
+	return true
+end
+
+-- The mud told us the effect is already up, so tracking was wrong. {affoff} clears it
+-- again when it really drops.
+function rsMarkUp(r)
+	if r == nil then return end
+	local sn = rsSn(r)
+	if sn == nil then return end
+	Spellups["QS"][sn] = nil
+	if Spellups["AF"]["list"][sn] == nil then
+		Spellups["AF"]["list"][sn] = 1
+		Spellups["AF"]["expires"][sn] = nil
+		hadarprint(r.skill.." is already up, correcting our tracking","debug")
+	end
+	Spellups["GL"][r.pending] = false
+	Spellups["GL"][r.key.."_suspended"] = false
+	r.blockedRoom = nil
+end
+
+-- A setting gated by class or race is switched off when the character does not fit.
+local function rsGateFail(r, why)
+	Spellups["GL"][r.setting] = "no"
+	Spellups["GL"][r.pending] = false
+	local sn = rsSn(r)
+	if sn ~= nil then Spellups["QS"][sn] = nil end
+	hadarprint(r.label.." auto-recast @RDISABLED@w - "..why,"script")
 end
 
 function rsClassCheck(r)
 	-- No class means anyone with the skill may use it (e.g. shadow form, available to
 	-- anyone with the psi secondary). rsUsable's prac check is then the only gate.
-	if r.class == nil then return true end
-	local ok, subclass = classCheck(r.class)
-	if not ok then
-		Spellups["GL"][r.setting] = "no"
-		Spellups["GL"][r.pending] = false
-		local sn = rsSn(r)
-		if sn ~= nil then Spellups["QS"][sn] = nil end
-		hadarprint(r.label.." auto-recast @RDISABLED@w - subclass is "..subclass..", not "..classNames(r.class),"script")
-		return false
+	if r.class ~= nil then
+		local ok, subclass = classCheck(r.class)
+		if not ok then
+			rsGateFail(r, "subclass is "..subclass..", not "..classNames(r.class))
+			return false
+		end
+	end
+	if r.race ~= nil then
+		-- Same leniency as classCheck: no race from GMCP yet means allow.
+		local race = gmcp("char.base.race")
+		if type(race) == "string" and race ~= "" and string.lower(race) ~= string.lower(r.race) then
+			rsGateFail(r, "race is "..race..", not "..r.race)
+			return false
+		end
 	end
 	return true
 end
 
--- Called whenever we might be able to act: standing up, a recovery clearing, etc.
+-- Called whenever we might be able to act: standing up, a recovery clearing, moving
+-- rooms, the periodic tick.
 function rsStateCheckOne(r)
-	if not rsEnabled(r) then return end
+	if not rsActive(r) then return end
+	if Spellups["GL"]["disabled"] == "yes" then return end
 	if os.time() < (tonumber(Spellups["GL"]["castholduntil"]) or 0) then return end
 	if not rsClassCheck(r) then return end
 	if not rsUsable(r) then return end
@@ -2287,33 +2505,22 @@ function rsStateCheckOne(r)
 	local sn = rsSn(r)
 	local rc = rsRc(r)
 
-	if Spellups["GL"][r.pending] then
-		if rc == nil or not hspRecoveryActive(rc) then
-			Spellups["GL"][r.pending] = false
-			hadarprint(r.skill.." pending and recovery clear, casting now","debug")
-			rsSend(r)
-		end
-		return
-	end
-
+	-- An older version queued these; the tracker no longer uses QS for them.
 	if Spellups["QS"][sn] ~= nil then
-		cast_this(sn, tonumber(Spellups["AS"]["list"][sn]["type"]))
-		return
+		Spellups["QS"][sn] = nil
+		Spellups["GL"][r.pending] = true
 	end
 
-	-- Self heal. Not up, not queued, not pending, not on recovery means the tracking
-	-- was lost somewhere and nothing else will ever bring it back. Worst case the mud
-	-- tells us we already have it.
-	--
-	-- char.status fires every combat round, so for a no-cooldown skill this branch
-	-- could re-send before the {affon} for our last cast has arrived. Debounce it so
-	-- one drop produces one cast attempt, not a stream.
-	if not hspAffectActive(sn) and (rc == nil or not hspRecoveryActive(rc)) then
-		if os.time() < (tonumber(r.healat) or 0) then return end
-		r.healat = os.time() + 3
-		hadarprint(r.skill.." untracked and castable, recasting","debug")
-		rsSend(r)
+	if hspAffectActive(sn) then
+		Spellups["GL"][r.pending] = false
+		return
 	end
+	if rc ~= nil and hspRecoveryActive(rc) then return end
+
+	-- Pending, or not up with tracking lost somewhere (a missed {affoff}, a relog).
+	-- rsTry's RS_WAIT keeps char.status, which fires every combat round, from sending
+	-- twice before the answer to our last attempt has arrived.
+	rsTry(r, "pending or not up")
 end
 
 function rsStateCheck()
@@ -2323,7 +2530,7 @@ function rsStateCheck()
 end
 
 function rsLoginCheckOne(r)
-	if not rsEnabled(r) then return end
+	if not rsActive(r) then return end
 	if not rsClassCheck(r) then return end
 	if not rsUsable(r) then return end
 
@@ -2338,18 +2545,18 @@ function rsLoginCheckOne(r)
 		return
 	end
 
-	if currentState == 3 then
-		hadarprint(r.skill.." not active on login, casting now","debug")
-		rsSend(r)
-	else
-		Spellups["QS"][sn] = Spellups["AS"]["list"][sn]["name"]
-		hadarprint(r.skill.." not active on login, queued for when standing","debug")
-	end
+	rsTry(r, "not active on login")
 end
 
 function rsLoginCheck()
 	for _,r in ipairs(recoverySkills) do
 		rsLoginCheckOne(r)
+	end
+end
+
+function hspRsTick()
+	if currentState == 3 then
+		rsStateCheck()
 	end
 end
 
@@ -2366,6 +2573,7 @@ function rsToggle(key, str)
 			return
 		end
 		Spellups["GL"][r.setting] = "yes"
+		Spellups["GL"][r.key.."_suspended"] = false
 		hadarprint(r.label.." auto-recast set to @GON","script")
 		if not rsUsable(r) then
 			hadarprint(r.label.." is not learned yet, so nothing will happen until it is","error")
@@ -2385,6 +2593,87 @@ function rsToggle(key, str)
 		hadarprint(r.label.." auto-recast is currently: "..status,"script")
 		hadarprint("Use @Ghsp "..r.key.." on@w or @Ghsp "..r.key.." off@w to toggle","script")
 	end
+end
+
+function hspDeseToggle()
+	if Spellups["GL"]["desecration_autocast"] == "yes" then
+		rsToggle("desecration", "off")
+	else
+		rsToggle("desecration", "on")
+	end
+end
+
+-- The server's "spellup" would cast desecration, which only the plugin should do (and
+-- only when asked). "forgetspell desecration" toggles its ignore list and replies with
+-- exactly "Added ..." or "Removed ...", but we cannot know the current state, so probe:
+--   probe   -> "Added":   it was not ignored and now is. spellup, then toggle it back.
+--   probe   -> "Removed": the user had it ignored and our probe lifted that. Put it back
+--                         FIRST, then spellup.
+-- The replies are gagged by the HSPdeseWrap triggers for the few seconds this takes.
+hspWrapState = nil -- nil (idle), "probe", "restore" or "readd"
+hspWrapSeq = 0
+hspWrapEcho = false
+
+local function hspSendSpellup(echo)
+	if echo then
+		Send("spellup")
+	else
+		SendNoEcho("spellup")
+	end
+end
+
+function hspMudsideSpellup(echo)
+	local r = rsFind("desecration")
+	if r == nil or not rsUsable(r) then
+		hspSendSpellup(echo)
+		return
+	end
+	if hspWrapState ~= nil then
+		hadarprint("forgetspell wrap already in progress, skipping this server spellup","debug")
+		return
+	end
+	hspWrapState = "probe"
+	hspWrapSeq = hspWrapSeq + 1
+	hspWrapEcho = echo
+	EnableTriggerGroup("HSPdeseWrap", true)
+	SendNoEcho("forgetspell desecration")
+	DoAfterSpecial(5, "hspDeseWrapTimeout(" .. hspWrapSeq .. ")", sendto.script)
+end
+
+function hspDeseWrapEnd()
+	hspWrapState = nil
+	EnableTriggerGroup("HSPdeseWrap", false)
+end
+
+function hspDeseAdded()
+	if hspWrapState == "probe" then
+		hspSendSpellup(hspWrapEcho)
+		SendNoEcho("forgetspell desecration")
+		hspWrapState = "restore"
+	elseif hspWrapState == "readd" then
+		hspDeseWrapEnd()
+	end
+end
+
+function hspDeseRemoved()
+	if hspWrapState == "probe" then
+		SendNoEcho("forgetspell desecration")
+		hspSendSpellup(hspWrapEcho)
+		hspWrapState = "readd"
+	elseif hspWrapState == "restore" then
+		hspDeseWrapEnd()
+	end
+end
+
+-- seq keeps an old timeout from ending a newer wrap. Never sends spellup: without a
+-- reply we do not know desecration is ignored, and casting it unasked is the one thing
+-- this exists to prevent.
+function hspDeseWrapTimeout(seq)
+	if seq ~= hspWrapSeq or hspWrapState == nil then return end
+	if hspWrapState == "probe" then
+		hadarprint("no reply to forgetspell desecration, server spellup skipped","debug")
+	end
+	hspDeseWrapEnd()
 end
 
 function auraset(arg)
@@ -2531,6 +2820,20 @@ function make_vis()
 		return
 	end
 	
+	-- Invis/shadow tracking would undo what the user just asked for. Pause those until
+	-- the effect comes back by itself ({affon} lifts it).
+	local paused = {}
+	for _,r in ipairs(recoverySkills) do
+		if r.suspendOnVis and rsEnabled(r) then
+			Spellups["GL"][r.key.."_suspended"] = true
+			Spellups["GL"][r.pending] = false
+			paused[#paused + 1] = r.label
+		end
+	end
+	if #paused > 0 then
+		hadarprint(table.concat(paused, " and ").." auto-recast paused until you're invisible/shadowed again","script")
+	end
+
 	HSPDisable("silentoff")
 	
 	SendNoEcho("vis")
@@ -2567,11 +2870,7 @@ function hspRefresh()
 		return
 	end
 	hadarprint("Refresh: sending spellup command to server","script")
-	if Spellups["GL"]["seespells"] == "yes" then
-		Send("spellup")
-	else
-		SendNoEcho("spellup")
-	end
+	hspMudsideSpellup(Spellups["GL"]["seespells"] == "yes")
 
 	-- Re-pull slist so RecoveriesUpdate can overwrite our recovery table with the
 	-- server's own view. This is the only way to unstick a recovery whose {recoff}
@@ -2723,6 +3022,15 @@ function hspDiag()
 		hadarprint("@Y-- "..r.label.." --@w","script")
 		hspDiagLine("autocast          ", Spellups["GL"][r.setting])
 		hspDiagLine("pending           ", Spellups["GL"][r.pending])
+		if r.race then
+			hspDiagLine("race gate         ", r.race)
+		end
+		if r.suspendOnVis then
+			hspDiagLine("paused by vis     ", Spellups["GL"][r.key.."_suspended"])
+		end
+		if r.key == "desecration" then
+			hspDiagLine("forgetspell wrap  ", hspWrapState or "idle")
+		end
 		if sn == nil then
 			hadarprint("  @Rnot found in slist, nothing will happen@w","script")
 		else
@@ -2912,17 +3220,7 @@ function recoff(n,l,wc)
 	for _,r in ipairs(recoverySkills) do
 		if rsRc(r) == sn and Spellups["GL"][r.pending] then
 			handled = true
-			Spellups["GL"][r.pending] = false
-			local rsn = rsSn(r)
-			if rsn ~= nil and Spellups["AS"]["list"][rsn] then
-				if currentState == 3 and os.time() >= (tonumber(Spellups["GL"]["castholduntil"]) or 0) then
-					hadarprint("recovery off, casting "..r.skill.." immediately","debug")
-					rsSend(r)
-				else
-					Spellups["QS"][rsn] = Spellups["AS"]["list"][rsn]["name"]
-					hadarprint("recovery off but not able to cast, queuing "..r.skill,"debug")
-				end
-			end
+			rsTry(r, "recovery cleared")
 		end
 	end
 	if handled then
@@ -3515,6 +3813,8 @@ function hspdied()
 	currentState = tonumber(gmcp("char.status.state")) or currentState
 	for _,r in ipairs(recoverySkills) do
 		Spellups["GL"][r.pending] = false
+		r.healat = nil
+		r.blockedRoom = nil
 	end
 	Spellups["QS"] = {}
 	-- The affoff burst for every affect we just lost arrives AFTER this trigger, and
@@ -4186,6 +4486,26 @@ function HadarHelp(str)
 			hadarprint("@x086| @x208handle, so the plugin tracks and re-uses them itself.             @x086|","helpfile2")
 		end
 		hadarprint("@x086+----------------------------------------------------------------------+@w","helpfile2")
+	elseif arg == "spriteinvis" or arg == "sprite" then
+		hadarprint("@x086+-------------------------@G[@CS@cprite @CI@cnvis @CH@celp@G]@x086--------------------------+@w","helpfile2")
+		hadarprint("@x086| @x214hsp spriteinvis        Shows current auto-invis status               @x086|","helpfile2")
+		hadarprint("@x086| @x208hsp spriteinvis on     Keeps racial invis up, reuses it whenever     @x086|","helpfile2")
+		hadarprint("@x086| @x208                       it drops (standing, not in a fight)           @x086|","helpfile2")
+		hadarprint("@x086| @x214hsp spriteinvis off    Stops; invis is then cast like a normal spell @x086|","helpfile2")
+		hadarprint("@x086| @x208hsp sprite on|off      Same as hsp spriteinvis on|off                @x086|","helpfile2")
+		hadarprint("@x086| @x214                                                                     @x086|","helpfile2")
+		hadarprint("@x086| @x208Sprites only, no practice needed. Typing vis pauses it until         @x086|","helpfile2")
+		hadarprint("@x086| @x208you are invisible again, so the two do not fight.                    @x086|","helpfile2")
+		hadarprint("@x086+----------------------------------------------------------------------+@w","helpfile2")
+	elseif arg == "desecration" or arg == "dese" then
+		hadarprint("@x086+--------------------------@G[@CD@cesecration @CH@celp@G]@x086--------------------------+@w","helpfile2")
+		hadarprint("@x086| @x214hsp desecration        Shows current auto-recast status              @x086|","helpfile2")
+		hadarprint("@x086| @x208hsp desecration on|off Keeps desecration up whenever it falls off    @x086|","helpfile2")
+		hadarprint("@x086| @x214dese                   Toggles hsp desecration on/off                @x086|","helpfile2")
+		hadarprint("@x086| @x208                                                                     @x086|","helpfile2")
+		hadarprint("@x086| @x214Harmer only. The server spellup command is told to skip it           @x086|","helpfile2")
+		hadarprint("@x086| @x214(forgetspell wrap), so only the plugin casts it, and only when on.   @x086|","helpfile2")
+		hadarprint("@x086+----------------------------------------------------------------------+@w","helpfile2")
 	elseif arg == "quickstab" then
 		hadarprint("@x086+----------------------@G[@CQ@cuickstab @CH@celp @CF@ciles@G]@x086------------------------+@w","helpfile2")
 		hadarprint("@x086| @x214hsp quickstab        @x110- @x214Shows current quickstab auto-recast status    @x086|","helpfile2")
@@ -4225,6 +4545,9 @@ function HadarHelp(str)
 		hadarprint("@x086| @x208hsp stealth on|off       @x110- @x208Auto-recast stealth (Ninja)                  @x086|@w","helpfile")
 		hadarprint("@x086| @x214hsp stalk on|off         @x110- @x214Auto-recast stalk (Ninja)                    @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp shadow on|off        @x110- @x208Auto-recast shadow form (if learned)         @x086|@w","helpfile")
+		hadarprint("@x086| @x214hsp spriteinvis on|off   @x110- @x214Keep racial invis up (Sprite)                @x086|@w","helpfile")
+		hadarprint("@x086| @x208hsp desecration on|off   @x110- @x208Keep desecration up (Harmer)                 @x086|@w","helpfile")
+		hadarprint("@x086| @x214dese                     @x110- @x214Toggle hsp desecration on/off                @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp autoaura <command>   @x110- @x208Has multiple commands, they are:             @x086|@w","helpfile")
 		hadarprint("@x086|                           @x208 On  @x110-@x214 enables wearing aura in combat         @x086|@w","helpfile")
 		hadarprint("@x086|                           @x208 Off @x110-@x214 diables wearing aura in combat         @x086|@w","helpfile")
@@ -4259,6 +4582,8 @@ function HadarHelp(str)
 		hadarprint("@x086|                              @x214hsp help stealth                            @x086|@w","helpfile")
 		hadarprint("@x086|                              @x208hsp help stalk                              @x086|@w","helpfile")
 		hadarprint("@x086|                              @x214hsp help shadow                             @x086|@w","helpfile")
+		hadarprint("@x086|                              @x208hsp help spriteinvis                        @x086|@w","helpfile")
+		hadarprint("@x086|                              @x214hsp help desecration                        @x086|@w","helpfile")
 		hadarprint("@x086+-------------------------------------------------------------------------+@w","helpfile")
 	end
 end
