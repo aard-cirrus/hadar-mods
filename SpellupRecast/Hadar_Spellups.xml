@@ -11,7 +11,7 @@
    save_state="y"
    date_written="2021-12-31 00:00:00"
    requires="4.00"
-   version="1.21"
+   version="1.22"
    >
 
 </plugin>
@@ -223,6 +223,33 @@
      keep_evaluating="y"
      sequence="100"
      script="spriteInvisDown"
+>
+</trigger>
+<!-- aflags, sent by the plugin itself at login/reload and on hsp refresh: gagged and parsed.
+     Transient gags: HSPaflagsHead is on only from sending aflags until its first line, and
+     HSPaflagsMore only for the wrapped continuation lines (each ends with a comma while more
+     follow, so the block's end is known exactly). Both are forced off on load, connect and
+     disconnect and by a 4 second timeout, so a manual aflags is never hidden. -->
+<trigger
+     name="HSPaflagsHeader"
+     group="HSPaflagsHead"
+     enabled="n"
+     match="^Affect Flags:\s*(.*)$"
+     regexp="y"
+     omit_from_output="y"
+     sequence="100"
+     script="hspAflagsHead"
+>
+</trigger>
+<trigger
+     name="HSPaflagsCont"
+     group="HSPaflagsMore"
+     enabled="n"
+     match="^\s+(\S.*)$"
+     regexp="y"
+     omit_from_output="y"
+     sequence="100"
+     script="hspAflagsMore"
 >
 </trigger>
 <!-- Per-skill debug (hsp spriteinvis debug): game lines about visibility, so we can see
@@ -660,6 +687,9 @@ function OnPluginInstall ()
 	-- them off before OnPluginEnable, which may start a fresh slist capture.
 	EnableTriggerGroup("HSPslistCapture", false)
 	EnableTriggerGroup("HSPdeseWrap", false)
+	EnableTriggerGroup("HSPaflagsHead", false)
+	EnableTriggerGroup("HSPaflagsMore", false)
+	if hspAflags ~= nil then hspAflags.state = nil end
 	EnableTrigger("HSPRecoveriesStart", false)
 	EnableTrigger("HSPRecoveriesCapture", false)
 	EnableTrigger("HSPRecoveriesEnd", false)
@@ -681,6 +711,9 @@ end
 function OnPluginConnect ()
 	EnableTriggerGroup("HSPslistCapture", false)
 	EnableTriggerGroup("HSPdeseWrap", false)
+	EnableTriggerGroup("HSPaflagsHead", false)
+	EnableTriggerGroup("HSPaflagsMore", false)
+	if hspAflags ~= nil then hspAflags.state = nil end
 	EnableTrigger("HSPRecoveriesStart", false)
 	EnableTrigger("HSPRecoveriesCapture", false)
 	EnableTrigger("HSPRecoveriesEnd", false)
@@ -699,6 +732,9 @@ end
 function OnPluginDisconnect ()
 	EnableTriggerGroup("HSPslistCapture", false)
 	EnableTriggerGroup("HSPdeseWrap", false)
+	EnableTriggerGroup("HSPaflagsHead", false)
+	EnableTriggerGroup("HSPaflagsMore", false)
+	if hspAflags ~= nil then hspAflags.state = nil end
 	EnableTrigger("HSPRecoveriesStart", false)
 	EnableTrigger("HSPRecoveriesCapture", false)
 	EnableTrigger("HSPRecoveriesEnd", false)
@@ -710,6 +746,12 @@ end
 -- plugin again brings it back.
 function OnPluginDisable ()
 	hspmwStop()
+end
+
+-- The output view changed size: at client start once it has finished laying out, and on any
+-- later resize. Re-show the window at its saved spot (pulled into view if needed).
+function OnPluginWorldOutputResized ()
+	if hspmw ~= nil and hspmw.ready then hspmwPlace() end
 end
 
 function OnPluginEnable ()
@@ -2395,6 +2437,7 @@ end
 -- combatOk = may also be used while fighting (char.status 8). Without it: standing only.
 -- upFlag   = GL setting holding a text-tracked "is up" (true/false, nil = unknown), for an
 --            effect the game reports only in text. While on, its affect tags are ignored.
+-- aflag    = name in the aflags list; checked with aflags at login/reload and hsp refresh.
 -- debugTags = its debug mode also logs every {affon}/{affoff}/{sfail} and visibility text.
 -- autoOnRace = the race decides: on by itself when the race gate matches (unless the
 --              user chose with the command - remembered), off for any other race.
@@ -2413,7 +2456,7 @@ recoverySkills = {
 		setting = "shadow_autocast",    pending = "shadow_pending"},
 	{key = "spriteinvis", skill = "invis", cmd = "invis", label = "Sprite invis", race = "Sprite",
 		noPrac = true, fallbackSn = 58, yieldWhenOff = true, suspendOnVis = true, autoOnRace = true,
-		debugTags = true, upFlag = "spriteinvis_up",
+		debugTags = true, upFlag = "spriteinvis_up", aflag = "invis",
 		setting = "spriteinvis_autocast", pending = "spriteinvis_pending"},
 	{key = "desecration", skill = "desecration", cmd = "cast desecration", label = "Desecration",
 		class = "Harmer", combatOk = true,
@@ -2623,6 +2666,8 @@ function rsTry(r, why)
 		hold = "cast hold after death/resting"
 	elseif r.blockedRoom ~= nil and r.blockedRoom == gmcp("room.info.num") then
 		hold = "blocked in this room"
+	elseif r.aflagsWait ~= nil and os.time() < r.aflagsWait then
+		hold = "waiting for the aflags check"
 	end
 	if hold then
 		Spellups["GL"][r.pending] = true
@@ -2741,6 +2786,12 @@ function rsLoginCheckOne(r)
 	if not rsClassCheck(r) then return end
 	if not rsUsable(r) then return end
 
+	-- Shown in aflags: ask the game rather than guess, even if we believe it is up.
+	if r.aflag ~= nil then
+		hspAflagsProbe("login/reload")
+		return
+	end
+
 	local sn = rsSn(r)
 	local rc = rsRc(r)
 
@@ -2845,6 +2896,95 @@ function rsToggle(key, str)
 		hadarprint(r.label.." auto-recast is currently: "..status,"script")
 		hadarprint("Use @Ghsp "..r.key.." on@w or @Ghsp "..r.key.." off@w to toggle, @Ghsp "..r.key.." debug@w to trace it","script")
 	end
+end
+
+-- aflags lists every affect flag on you whatever gave it: racial invis shows as "invis",
+-- exactly like the spell. It is the only way to ask the game. Used just to settle tracked
+-- state at login/reload and on hsp refresh, with its output gagged.
+hspAflags = {state = nil, seq = 0, buf = "", doneat = 0}
+
+function hspAflagsWanted()
+	for _,r in ipairs(recoverySkills) do
+		if r.aflag ~= nil and rsActive(r) and rsUsable(r) and rsClassCheck(r) then return true end
+	end
+	return false
+end
+
+function hspAflagsProbe(why)
+	local a = hspAflags
+	if a.state ~= nil then return end                      -- one already in flight
+	if os.time() - (a.doneat or 0) < 5 then return end     -- refresh and its own slist both ask
+	if not hspAflagsWanted() then return end
+	a.state, a.buf, a.seq = "head", "", a.seq + 1
+	for _,r in ipairs(recoverySkills) do
+		if r.aflag ~= nil then
+			r.aflagsWait = os.time() + 5
+			rsDbg(r, "checking aflags ("..tostring(why)..")")
+		end
+	end
+	EnableTriggerGroup("HSPaflagsHead", true)
+	SendNoEcho("aflags")
+	DoAfterSpecial(4, "hspAflagsTimeout("..a.seq..")", sendto.script)
+end
+
+function hspAflagsEnd()
+	hspAflags.state = nil
+	hspAflags.doneat = os.time()
+	EnableTriggerGroup("HSPaflagsHead", false)
+	EnableTriggerGroup("HSPaflagsMore", false)
+end
+
+-- No (complete) reply: stop gagging, and fall back to just using the skill.
+function hspAflagsTimeout(seq)
+	if seq ~= hspAflags.seq or hspAflags.state == nil then return end
+	hspAflagsEnd()
+	for _,r in ipairs(recoverySkills) do
+		if r.aflag ~= nil and r.aflagsWait ~= nil then
+			r.aflagsWait = nil
+			rsDbg(r, "no aflags reply, falling back")
+			if not rsIsUp(r) then rsTry(r, "no aflags reply") end
+		end
+	end
+end
+
+-- One line of the list. A trailing comma means another line follows; without one the
+-- list is complete. Flags are matched whole: "detectinvis" is not "invis".
+function hspAflagsChunk(text)
+	text = tostring(text or "")
+	hspAflags.buf = hspAflags.buf .. "," .. text
+	if text:match(",%s*$") then
+		hspAflags.state = "more"
+		EnableTriggerGroup("HSPaflagsHead", false)
+		EnableTriggerGroup("HSPaflagsMore", true)
+		return
+	end
+	local flags = {}
+	for f in hspAflags.buf:gmatch("[^,]+") do
+		f = string.lower((f:gsub("^%s+", ""):gsub("%s+$", "")))
+		if f ~= "" then flags[f] = true end
+	end
+	hspAflagsEnd()
+	for _,r in ipairs(recoverySkills) do
+		if r.aflag ~= nil and r.aflagsWait ~= nil then
+			r.aflagsWait = nil
+			if flags[r.aflag] then
+				rsSetUp(r, true, "aflags shows "..r.aflag)
+			else
+				rsSetUp(r, false, "aflags has no "..r.aflag)
+				if rsActive(r) and rsUsable(r) then rsTry(r, "aflags: no "..r.aflag) end
+			end
+		end
+	end
+end
+
+function hspAflagsHead(name, line, wc)
+	if hspAflags.state ~= "head" then return end
+	hspAflagsChunk(wc[1])
+end
+
+function hspAflagsMore(name, line, wc)
+	if hspAflags.state ~= "more" then return end
+	hspAflagsChunk(wc[1])
 end
 
 function hspDeseToggle()
@@ -3152,6 +3292,7 @@ function hspRefresh()
 	slistCommandSent = false
 	SendSlistCommand()
 
+	hspAflagsProbe("hsp refresh")
 	rsStateCheck()
 end
 
@@ -4854,20 +4995,27 @@ function hspmwSetup()
 	local lay = hspmwLayout()
 	WindowResize(hs.win, lay.w, lay.h, hs.bg)
 	hs.w, hs.h, hs.fitw = lay.w, lay.h, lay.fitw
-	if mw.pos == 0 then
-		-- Pull it back into view if the client got smaller since it was saved. Skipped when the
-		-- output view is not sized yet (reports 0).
-		local vw, vh = tonumber(GetInfo(281)) or 0, tonumber(GetInfo(280)) or 0
-		if vw > 0 and vh > 0 then
-			mw.left = math.max(0, math.min(tonumber(mw.left) or 0, vw - lay.w))
-			mw.top = math.max(0, math.min(tonumber(mw.top) or 0, vh - hs.titleh))
-			WindowPosition(hs.win, mw.left, mw.top, 0, 2)
-		end
-	end
 	hs.dragging = false
 	hs.sig = nil
 	hs.ready = true
+	hspmwPlace()
 	WindowShow(hs.win, true)
+end
+
+-- Show the window at its saved spot, pulled into the output view when the view is smaller.
+-- Never writes the saved spot: at client start the view reports a smaller size until the
+-- client has finished laying itself out, and saving the pulled-in spot then moved the window
+-- for good. OnPluginWorldOutputResized calls this again once the real size is known.
+function hspmwPlace()
+	local hs, mw = hspmw, Spellups["MW"]
+	if mw == nil or mw.enabled ~= "yes" or mw.pos ~= 0 or not hs.ready then return end
+	local x, y = tonumber(mw.left) or 0, tonumber(mw.top) or 0
+	local vw, vh = tonumber(GetInfo(281)) or 0, tonumber(GetInfo(280)) or 0
+	if vw > 0 and vh > 0 then
+		x = math.max(0, math.min(x, vw - (hs.w or 0)))
+		y = math.max(0, math.min(y, vh - (hs.titleh or 0)))
+	end
+	WindowPosition(hs.win, x, y, 0, 2)
 end
 
 -- Hotspot ids are fixed (title, close, body, row:<key>, resize). They never overlap, because
@@ -5016,7 +5164,7 @@ function hspmw_body_up(flags, hotspot_id)
 end
 
 function hspmw_row_up(flags, hotspot_id)
-	if bit.band(flags, 0x20) ~= 0 then hspmwMenu(tostring(hotspot_id):match("^row:(.+)$")) end
+	if bit.band(flags, 0x20) ~= 0 then hspmwMenu() end
 end
 
 function hspmw_close_up(flags, hotspot_id)
@@ -5050,10 +5198,24 @@ function hspmw_drop(flags, hotspot_id)
 	if newx and newy and vw > 0 and vh > 0 and (newx < 0 or newx > vw or newy < 0 or newy > vh) then
 		WindowPosition(hs.win, hs.origx, hs.origy, 0, 2)
 	end
-	mw.left = WindowInfo(hs.win, 10) or mw.left
-	mw.top = WindowInfo(hs.win, 11) or mw.top
-	mw.pos = 0 -- mode 0 + flag 2 from now on; modes 1-3 stretch
+	local nx, ny = WindowInfo(hs.win, 10), WindowInfo(hs.win, 11)
 	hs.dragging = false
+	-- A click that moved nothing must not save: the window may only be showing pulled into a
+	-- temporarily small view, and saving that spot would make it permanent.
+	if nx == nil or ny == nil or (nx == hs.origx and ny == hs.origy) then return end
+	-- Keep it wholly in view, the same rule hspmwPlace applies on every load, so the spot
+	-- saved is the spot that comes back after a restart.
+	local vw, vh = tonumber(GetInfo(281)) or 0, tonumber(GetInfo(280)) or 0
+	if vw > 0 and vh > 0 then
+		local cx = math.max(0, math.min(nx, vw - (hs.w or 0)))
+		local cy = math.max(0, math.min(ny, vh - (hs.titleh or 0)))
+		if cx ~= nx or cy ~= ny then
+			nx, ny = cx, cy
+			WindowPosition(hs.win, nx, ny, 0, 2)
+		end
+	end
+	mw.left, mw.top = nx, ny
+	mw.pos = 0 -- mode 0 + flag 2 from now on; modes 1-3 stretch
 	SaveState()
 end
 
@@ -5098,9 +5260,10 @@ function hspmw_resize_drop(flags, hotspot_id)
 end
 
 -- ---------------------------------------------------------------- menu
--- rowkey: set when opened from a row, which adds "Colour for <label>..." at the top.
+-- The same menu wherever you right-click. Name colours live only in its Name colour
+-- submenu, never as separate per-row entries.
 -- Labels are non-numeric and unique, so a returned label can never be mistaken for an index.
-function hspmwMenu(rowkey)
+function hspmwMenu()
 	local hs, mw = hspmw, Spellups["MW"]
 	local ents = hspmwEntries()
 	local items, parts = {}, {}
@@ -5109,14 +5272,6 @@ function hspmwMenu(rowkey)
 		parts[#parts + 1] = (checked and "+" or "")..it.label
 	end
 
-	if rowkey ~= nil then
-		for _,e in ipairs(ents) do
-			if e.key == rowkey then
-				leaf({kind = "colour", key = e.key, label = "Colour for "..e.label.."..."})
-				parts[#parts + 1] = "-"
-			end
-		end
-	end
 	parts[#parts + 1] = ">Show on window"
 	for _,e in ipairs(ents) do
 		local shown = hspmwShown(e)
