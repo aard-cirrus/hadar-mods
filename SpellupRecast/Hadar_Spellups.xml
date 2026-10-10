@@ -11,7 +11,7 @@
    save_state="y"
    date_written="2021-12-31 00:00:00"
    requires="4.00"
-   version="1.20"
+   version="1.21"
    >
 
 </plugin>
@@ -201,6 +201,41 @@
      omit_from_output="y"
      sequence="100"
      script="hspDeseRemoved"
+>
+</trigger>
+<!-- Sprite racial invis sends NO affect tags, only these messages (the invisibility spell
+     sends {affon}/{affoff} 58 as well). Either kind of invisibility counts. -->
+<trigger
+     name="spriteInvisUp"
+     enabled="y"
+     match="^(You vanish out of sight!|You fade out of existence\.)$"
+     regexp="y"
+     keep_evaluating="y"
+     sequence="100"
+     script="spriteInvisUp"
+>
+</trigger>
+<trigger
+     name="spriteInvisDown"
+     enabled="y"
+     match="^(You are no longer invisible\.|You fade into existence\.)$"
+     regexp="y"
+     keep_evaluating="y"
+     sequence="100"
+     script="spriteInvisDown"
+>
+</trigger>
+<!-- Per-skill debug (hsp spriteinvis debug): game lines about visibility, so we can see
+     what the game says when racial invis comes and goes. Only prints while that debug is
+     on; it never gags anything. -->
+<trigger
+     name="rsDbgVisText"
+     enabled="y"
+     match="(?i)(invis|visib|fade|vanish)"
+     regexp="y"
+     keep_evaluating="y"
+     sequence="100"
+     script="rsDbgVisLine"
 >
 </trigger>
 <trigger
@@ -556,6 +591,8 @@ function OnPluginBroadcast(msg, id, name, text)
 			if currentState == 3 then
 				sancTryRestore()
 				rsStateCheck()
+			elseif currentState == 8 then
+				rsStateCheck() -- only combat-capable skills (desecration) act while fighting
 			end
 			cast_spells()
 			SendSlistCommand()
@@ -570,7 +607,7 @@ function OnPluginBroadcast(msg, id, name, text)
 				cast_spells()
 			end
 			-- Moving out of a nocast room is what unblocks a tracked skill.
-			if currentState == 3 then
+			if currentState == 3 or currentState == 8 then
 				rsStateCheck()
 			end
 		end
@@ -652,6 +689,8 @@ function OnPluginConnect ()
 	-- A fresh login resumes tracking: nothing paused by vis last session still applies.
 	if Spellups ~= nil and Spellups["GL"] ~= nil then
 		for _,r in ipairs(recoverySkills) do
+			if Spellups["GL"][r.key.."_suspended"] then rsDbg(r, "login: vis pause lifted") end
+			if r.upFlag ~= nil then Spellups["GL"][r.upFlag] = nil end
 			Spellups["GL"][r.key.."_suspended"] = false
 		end
 	end
@@ -665,6 +704,12 @@ function OnPluginDisconnect ()
 	EnableTrigger("HSPRecoveriesEnd", false)
 	slistCommandSent = false
 	hspWrapState = nil
+end
+
+-- Hide the window and stop its timer; the saved enabled flag is left alone so enabling the
+-- plugin again brings it back.
+function OnPluginDisable ()
+	hspmwStop()
 end
 
 function OnPluginEnable ()
@@ -712,11 +757,16 @@ function OnPluginEnable ()
 	for _,r in ipairs(recoverySkills) do
 		Spellups["GL"][r.pending] = false
 		r.sn = nil -- force a fresh namelist lookup
+		if r.upFlag ~= nil then Spellups["GL"][r.upFlag] = nil end -- unknown until the game says
 		r.healat = nil
 		r.blockedRoom = nil
 	end
 	-- Always checking: a missed {affoff} or a blocked attempt is retried from here.
 	AddTimer("HSPrsTick", 0, 0, 10, "", timer_flag.Enabled + timer_flag.Replace + timer_flag.Temporary, "hspRsTick")
+	-- Before the early return for an unknown clan skill below. pcall so a drawing problem can
+	-- never stop the rest of the enable (the slist request) from running.
+	local mwok, mwerr = pcall(hspmwResume)
+	if not mwok then hadarprint("Special Affects window failed to start: "..tostring(mwerr),"error") end
 	Spellups["AF"]["list"][601] = nil
 	-- A saved "restoring" would block every future restore attempt. If sanctuary was
 	-- down when we last saved, assume the aura is still on us and re-arm the restore
@@ -871,8 +921,22 @@ function injectVars()
 	v["TB"] = {} --same but Bear^
 	v["TE"] = {} --same but Ent^^
 	v["OE"] = {} --Oracle Execptions
+	v["MW"] = {} --Special Affects miniwindow (hsp miniwin)
 
 	v["AS"]["namelist"] = {}
+
+	-- Special Affects Tracker window. w/h of 0 = fit the contents; pos 6 = top-right until the
+	-- window is dragged (then 0 with an absolute left/top).
+	v["MW"]["enabled"] = "no"
+	v["MW"]["pos"] = 6
+	v["MW"]["left"] = 0
+	v["MW"]["top"] = 0
+	v["MW"]["w"] = 0
+	v["MW"]["h"] = 0
+	v["MW"]["font"] = "Courier New"
+	v["MW"]["size"] = 9
+	v["MW"]["show"] = {} -- key -> true/false; missing = the default for this character
+	v["MW"]["colors"] = {} -- key -> name colour
      
     v["GL"]["initilized"] = "no"
 	v["GL"]["Debug"] = "no"
@@ -1281,6 +1345,8 @@ function HSPmain(name, line, wc)
 		hspRoomInfo()
 	elseif first == "sanc" or first == "sanctuary" then
 		hspSancKick()
+	elseif first == "miniwin" then
+		hspMiniwin(rest)
 	else
 		HadarHelp("nadda")
 	end
@@ -1318,6 +1384,7 @@ end
 
 function affon(name, line, wc)
 	local sn = tonumber(wc.sn) --skill number
+	rsDbgTag(line, sn)
 	local tm = tonumber(wc.time) --time affected
 	
 	if Spellups["GL"]["disabled"] == "yes" then
@@ -1341,8 +1408,9 @@ function affon(name, line, wc)
 	end
 	Spellups["NA"][sn] = 0 --not affected false
 	for _,r in ipairs(recoverySkills) do
-		if rsSn(r) == sn then
+		if rsSn(r) == sn and r.upFlag == nil then
 			Spellups["GL"][r.pending] = false
+			if rsSuspended(r) then rsDbg(r, "{affon} for it: up again, vis pause lifted") else rsDbg(r, "{affon} for it: tracking now says it is up") end
 			Spellups["GL"][r.key.."_suspended"] = false
 			r.blockedRoom = nil
 			r.healat = nil -- it landed: the answer RS_WAIT was waiting for
@@ -1370,6 +1438,7 @@ end
 
 function affoff(name,line,wc)
 	local sn = tonumber(wc.sn)
+	rsDbgTag(line, sn)
 	local wraithcastable = false
 	local wraithcounted = 0
 
@@ -1402,6 +1471,15 @@ function affoff(name,line,wc)
 	-- (invis would become "cast 'invis'"). rsTry is the single place they are used.
 	for _,r in ipairs(recoverySkills) do
 		if rsSn(r) == sn then
+			if r.upFlag ~= nil then
+				if not rsEnabled(r) then
+					break -- off: the invis spell is recast by the normal spellup path
+				end
+				Spellups["QS"][sn] = nil
+				rsDbg(r, "{affoff} ignored: tracked from the game's text only")
+				return
+			end
+			rsDbg(r, "{affoff} for it: tracking now says it is down")
 			if not rsEnabled(r) then
 				if r.yieldWhenOff then
 					-- Off means the normal spellup path looks after it (casters' invis).
@@ -1542,6 +1620,7 @@ function sfail(name,line,wc)
 	--sn == name, tg == target, fl == fail, rc == recovery
 
 	local sn = tonumber(wc.sn) --skill name
+	rsDbgTag(line, sn)
 	local tg = wc.tg --target
 	local fl = tonumber(wc.fl) --failed reason 1  - Regular fail, lost concentration. 2  - Already affected.3  - Cast blocked by a recovery, see below.4  - Not enough mana.5  - You are in a nocast room.6  - Fighting or other "can't concentrate".8  - You don't know the spell.9  - Tried to cast self only on other.10  - You are resting / sitting.11  - Skill/spell has been disabled. 12  - Not enough moves.
 	local rc = tonumber(wc.rc) --failed because recovery number
@@ -1568,6 +1647,11 @@ function sfail(name,line,wc)
 	-- Tracked skills never take the generic paths below. The mud's answer decides what
 	-- rsTry may do next.
 	local tr = rsOwner(sn)
+	if tr ~= nil and tr.upFlag ~= nil then
+		Spellups["QS"][sn] = nil
+		rsDbg(tr, "{sfail} ignored (fl="..tostring(fl).."): tracked from the game's text only")
+		return
+	end
 	if tr ~= nil then
 		Spellups["QS"][sn] = nil
 		tr.healat = 0 -- we have our answer, a retry is allowed
@@ -2071,6 +2155,28 @@ function spriteInvisAlreadyUp()
 	rsMarkUp(rsFind("spriteinvis"))
 end
 
+-- "You vanish out of sight!" (racial) / "You fade out of existence." (spell).
+function spriteInvisUp(name, line, wc)
+	rsSetUp(rsFind("spriteinvis"), true, "game: "..tostring(line))
+end
+
+-- "You are no longer invisible." / "You fade into existence." You are visible now, whatever
+-- the source, so the spell's affect is gone too even before its {affoff} arrives. Re-invis
+-- unless paused by vis (rsTry checks that, plus standing, holds and the answer wait).
+function spriteInvisDown(name, line, wc)
+	local r = rsFind("spriteinvis")
+	if r == nil then return end
+	rsSetUp(r, false, "game: "..tostring(line))
+	local sn = rsSn(r)
+	if sn ~= nil then
+		Spellups["AF"]["list"][sn] = nil
+		Spellups["AF"]["expires"][sn] = nil
+	end
+	if rsEnabled(r) and rsUsable(r) and rsClassCheck(r) then
+		rsTry(r, "game says no longer invisible")
+	end
+end
+
 -- Backup for {affoff}71, which stays the primary signal. This only has to do anything
 -- when the tag never arrived. Unlike the tag it cannot be the aura item coming off, so
 -- when it does act it is acting on solid information - including mid-restore, where it
@@ -2286,6 +2392,10 @@ end
 -- yieldWhenOff = while the toggle is off the normal spellup path owns the skill.
 --                Without it the tracker owns the skill even when off.
 -- suspendOnVis = the vis alias pauses it until the effect comes back.
+-- combatOk = may also be used while fighting (char.status 8). Without it: standing only.
+-- upFlag   = GL setting holding a text-tracked "is up" (true/false, nil = unknown), for an
+--            effect the game reports only in text. While on, its affect tags are ignored.
+-- debugTags = its debug mode also logs every {affon}/{affoff}/{sfail} and visibility text.
 -- autoOnRace = the race decides: on by itself when the race gate matches (unless the
 --              user chose with the command - remembered), off for any other race.
 -- Skill numbers and recovery groups are resolved from slist at runtime rather than
@@ -2303,9 +2413,10 @@ recoverySkills = {
 		setting = "shadow_autocast",    pending = "shadow_pending"},
 	{key = "spriteinvis", skill = "invis", cmd = "invis", label = "Sprite invis", race = "Sprite",
 		noPrac = true, fallbackSn = 58, yieldWhenOff = true, suspendOnVis = true, autoOnRace = true,
+		debugTags = true, upFlag = "spriteinvis_up",
 		setting = "spriteinvis_autocast", pending = "spriteinvis_pending"},
 	{key = "desecration", skill = "desecration", cmd = "cast desecration", label = "Desecration",
-		class = "Harmer",
+		class = "Harmer", combatOk = true,
 		setting = "desecration_autocast", pending = "desecration_pending"},
 }
 
@@ -2426,6 +2537,73 @@ function rsSend(r)
 	end
 end
 
+-- Per-skill debug (hsp <skill> debug): every decision the plugin makes about that one
+-- skill, shown whether or not the global hsp debug is on. Saved, so it survives a reload.
+function rsDebugOn(r)
+	return r ~= nil and Spellups ~= nil and Spellups["GL"] ~= nil and Spellups["GL"][r.key.."_debug"] == true
+end
+
+function rsDbg(r, msg)
+	if not rsDebugOn(r) then return end
+	ColourNote("magenta", "", "[HSP "..r.label.." debug] ", "silver", "", tostring(msg))
+end
+
+-- Like rsDbg, but quiet when the message repeats: char.status and the 10 s tick ask the
+-- same question over and over, and only a change in the answer is worth seeing.
+function rsDbgOnce(r, msg)
+	if not rsDebugOn(r) or r.lastdbg == msg then return end
+	r.lastdbg = msg
+	rsDbg(r, msg)
+end
+
+-- Skills with debugTags log every affect tag while their debug is on: we may not know
+-- which tag (if any) the game uses for them.
+function rsDbgTag(line, sn)
+	for _,r in ipairs(recoverySkills) do
+		if r.debugTags and rsDebugOn(r) then
+			local nm = sn and Spellups["AS"]["list"][sn] and Spellups["AS"]["list"][sn]["name"] or "?"
+			rsDbg(r, "tag "..tostring(line).."  ("..tostring(nm)..")")
+		end
+	end
+end
+
+function rsDbgVisLine(name, line, wc)
+	for _,r in ipairs(recoverySkills) do
+		if r.debugTags and rsDebugOn(r) then rsDbg(r, "game: "..tostring(line)) end
+	end
+end
+
+-- Is the effect up? Normally the affect-tag tracking. A skill with upFlag (sprite racial
+-- invis) goes by the game's text alone: the racial ability sends no tags at all, and the
+-- invis spell's {affon}/{affoff} 58 must not overrule what the text says.
+function rsIsUp(r)
+	if r.upFlag ~= nil then return Spellups["GL"][r.upFlag] == true end
+	local sn = rsSn(r)
+	if sn == nil then return false end
+	return hspAffectActive(sn)
+end
+
+-- Record the text-tracked state of an upFlag skill. Coming up is also the answer rsTry was
+-- waiting for, and lifts a vis pause.
+function rsSetUp(r, up, why)
+	if r == nil or r.upFlag == nil then return end
+	Spellups["GL"][r.upFlag] = up
+	if up then
+		Spellups["GL"][r.pending] = false
+		Spellups["GL"][r.key.."_suspended"] = false
+		r.blockedRoom = nil
+		r.healat = nil
+	end
+	r.lastdbg = nil
+	rsDbg(r, tostring(why)..": tracking now says "..(up and "up, vis pause (if any) lifted" or "down"))
+end
+
+-- Standing, or fighting for a skill that can be used mid-combat. Resting, sleeping etc.
+-- never.
+function rsStateOk(r)
+	return currentState == 3 or (r.combatOk == true and currentState == 8)
+end
+
 -- The single place a tracked skill is used. Returns true when the command was sent.
 -- When it cannot go now the skill is left pending, and the state check / recoff / the
 -- periodic tick try again. healat holds off a second send until the mud has had RS_WAIT
@@ -2433,22 +2611,34 @@ end
 function rsTry(r, why)
 	if not rsActive(r) then
 		Spellups["GL"][r.pending] = false
+		rsDbgOnce(r, "not used ("..tostring(why).."): "..(rsEnabled(r) and "paused by vis" or "auto-recast is off"))
 		return false
 	end
-	if Spellups["GL"]["disabled"] == "yes"
-		or currentState ~= 3
-		or os.time() < (tonumber(Spellups["GL"]["castholduntil"]) or 0)
-		or (r.blockedRoom ~= nil and r.blockedRoom == gmcp("room.info.num")) then
+	local hold = nil
+	if Spellups["GL"]["disabled"] == "yes" then
+		hold = "plugin is disabled/paused"
+	elseif not rsStateOk(r) then
+		hold = (r.combatOk and "not standing or fighting" or "not standing").." (state "..tostring(currentState)..")"
+	elseif os.time() < (tonumber(Spellups["GL"]["castholduntil"]) or 0) then
+		hold = "cast hold after death/resting"
+	elseif r.blockedRoom ~= nil and r.blockedRoom == gmcp("room.info.num") then
+		hold = "blocked in this room"
+	end
+	if hold then
 		Spellups["GL"][r.pending] = true
+		rsDbgOnce(r, "pending ("..tostring(why).."): "..hold)
 		return false
 	end
 	if os.time() < (tonumber(r.healat) or 0) then
 		Spellups["GL"][r.pending] = true
+		rsDbgOnce(r, "pending ("..tostring(why).."): waiting "..(tonumber(r.healat) - os.time()).."s for the game to answer the last attempt")
 		return false
 	end
 	r.healat = os.time() + RS_WAIT
 	Spellups["GL"][r.pending] = false
 	hadarprint(r.skill.." "..tostring(why)..", using it now","debug")
+	r.lastdbg = nil
+	rsDbg(r, "SENT '"..tostring(r.cmd or r.skill).."' ("..tostring(why)..")")
 	rsSend(r)
 	return true
 end
@@ -2457,6 +2647,10 @@ end
 -- again when it really drops.
 function rsMarkUp(r)
 	if r == nil then return end
+	if r.upFlag ~= nil then
+		rsSetUp(r, true, "game says it is already up")
+		return
+	end
 	local sn = rsSn(r)
 	if sn == nil then return end
 	Spellups["QS"][sn] = nil
@@ -2468,6 +2662,7 @@ function rsMarkUp(r)
 	Spellups["GL"][r.pending] = false
 	Spellups["GL"][r.key.."_suspended"] = false
 	r.blockedRoom = nil
+	rsDbg(r, "game says it is already up: tracking corrected, vis pause (if any) lifted")
 end
 
 -- A setting gated by class or race is switched off when the character does not fit.
@@ -2503,11 +2698,15 @@ end
 -- Called whenever we might be able to act: standing up, a recovery clearing, moving
 -- rooms, the periodic tick.
 function rsStateCheckOne(r)
-	if not rsActive(r) then return end
-	if Spellups["GL"]["disabled"] == "yes" then return end
-	if os.time() < (tonumber(Spellups["GL"]["castholduntil"]) or 0) then return end
-	if not rsClassCheck(r) then return end
-	if not rsUsable(r) then return end
+	if not rsStateOk(r) then return end
+	if not rsActive(r) then
+		rsDbgOnce(r, "check: "..(rsEnabled(r) and "paused by vis" or "auto-recast is off"))
+		return
+	end
+	if Spellups["GL"]["disabled"] == "yes" then rsDbgOnce(r, "check: plugin is disabled/paused") return end
+	if os.time() < (tonumber(Spellups["GL"]["castholduntil"]) or 0) then rsDbgOnce(r, "check: cast hold") return end
+	if not rsClassCheck(r) then rsDbgOnce(r, "check: class/race doesn't fit") return end
+	if not rsUsable(r) then rsDbgOnce(r, "check: not learned / skill number unknown") return end
 
 	local sn = rsSn(r)
 	local rc = rsRc(r)
@@ -2518,11 +2717,12 @@ function rsStateCheckOne(r)
 		Spellups["GL"][r.pending] = true
 	end
 
-	if hspAffectActive(sn) then
+	if rsIsUp(r) then
 		Spellups["GL"][r.pending] = false
+		rsDbgOnce(r, "check: tracking says it is up, nothing to do")
 		return
 	end
-	if rc ~= nil and hspRecoveryActive(rc) then return end
+	if rc ~= nil and hspRecoveryActive(rc) then rsDbgOnce(r, "check: recovery "..rc.." running") return end
 
 	-- Pending, or not up with tracking lost somewhere (a missed {affoff}, a relog).
 	-- rsTry's RS_WAIT keeps char.status, which fires every combat round, from sending
@@ -2544,7 +2744,7 @@ function rsLoginCheckOne(r)
 	local sn = rsSn(r)
 	local rc = rsRc(r)
 
-	if hspAffectActive(sn) then return end
+	if rsIsUp(r) then return end
 
 	if rc ~= nil and hspRecoveryActive(rc) then
 		Spellups["GL"][r.pending] = true
@@ -2578,6 +2778,7 @@ function rsRaceAuto()
 					Spellups["GL"][r.setting] = "yes"
 					Spellups["GL"][r.key.."_suspended"] = false
 					hadarprint(r.race.." detected: "..r.label.." auto-recast is @GON@c (@Ghsp "..r.key.." off@c to stop)","script")
+					rsDbg(r, "race "..race..": switched on automatically")
 				end
 			else
 				Spellups["GL"][r.key.."_userset"] = false
@@ -2585,6 +2786,7 @@ function rsRaceAuto()
 					Spellups["GL"][r.setting] = "no"
 					Spellups["GL"][r.pending] = false
 					hadarprint("Not a "..r.race.." ("..race.."): "..r.label.." auto-recast is @ROFF","script")
+					rsDbg(r, "race "..race..": switched off automatically")
 				end
 			end
 		end
@@ -2592,7 +2794,7 @@ function rsRaceAuto()
 end
 
 function hspRsTick()
-	if currentState == 3 then
+	if currentState == 3 or currentState == 8 then
 		rsStateCheck()
 	end
 end
@@ -2602,6 +2804,15 @@ function rsToggle(key, str)
 	local r = rsFind(key)
 	if r == nil then return end
 	local arg = string.lower(str or "")
+
+	if arg == "debug" then
+		local on = Spellups["GL"][r.key.."_debug"] ~= true
+		Spellups["GL"][r.key.."_debug"] = on
+		r.lastdbg = nil
+		hadarprint(r.label.." debug is "..(on and "@GON@c: every decision about it is shown, and @Ghsp "..r.key.." debug@c again stops it" or "@ROFF"),"script")
+		SaveState()
+		return
+	end
 
 	if (arg == "on" or arg == "off") and r.autoOnRace then
 		Spellups["GL"][r.key.."_userset"] = true
@@ -2632,7 +2843,7 @@ function rsToggle(key, str)
 	else
 		local status = Spellups["GL"][r.setting] == "yes" and "@GON" or "@ROFF"
 		hadarprint(r.label.." auto-recast is currently: "..status,"script")
-		hadarprint("Use @Ghsp "..r.key.." on@w or @Ghsp "..r.key.." off@w to toggle","script")
+		hadarprint("Use @Ghsp "..r.key.." on@w or @Ghsp "..r.key.." off@w to toggle, @Ghsp "..r.key.." debug@w to trace it","script")
 	end
 end
 
@@ -2856,18 +3067,38 @@ end
 function make_vis()
 	hadarprint("Letting you go visible","script")
 	EnableAlias("do_vis", false)
-		
+	-- vis always ends invisibility. Record that before anything can return early, whether
+	-- or not the skill's auto-recast is on and even with the plugin disabled.
+	for _,r in ipairs(recoverySkills) do
+		if r.upFlag ~= nil then
+			Spellups["GL"][r.upFlag] = false
+			rsDbg(r, "vis typed: tracking now says down")
+		end
+	end
+
 	if Spellups["GL"]["disabled"] == "yes" then
+		-- The plugin is off, so there is nothing to pause - but the command must still reach
+		-- the game, and the alias must come back (upstream returned before both).
+		SendNoEcho("vis")
+		EnableAlias("do_vis", true)
 		return
 	end
-	
+
 	-- Invis/shadow tracking would undo what the user just asked for. Pause those until
-	-- the effect comes back by itself ({affon} lifts it).
+	-- the effect comes back by itself ({affon} lifts it). vis also ends the effect itself,
+	-- whether or not the game sends an {affoff} for it, so stop believing it is up.
 	local paused = {}
 	for _,r in ipairs(recoverySkills) do
 		if r.suspendOnVis and rsEnabled(r) then
 			Spellups["GL"][r.key.."_suspended"] = true
 			Spellups["GL"][r.pending] = false
+			local vsn = rsSn(r)
+			if vsn ~= nil then
+				Spellups["AF"]["list"][vsn] = nil
+				Spellups["AF"]["expires"][vsn] = nil
+			end
+			if r.upFlag ~= nil then Spellups["GL"][r.upFlag] = false end
+			rsDbg(r, "vis typed: tracking says down, paused until it is up again")
 			paused[#paused + 1] = r.label
 		end
 	end
@@ -2885,6 +3116,8 @@ end
 
 function make_land()
 	if Spellups["GL"]["disabled"] == "yes" then
+		-- plugin off: nothing to pause, but don't swallow the command
+		SendNoEcho("land")
 		return
 	end
 
@@ -2961,7 +3194,9 @@ function hspDiagLine(label,v)
 end
 
 function hspDiagStateName(s)
-	local names = {[3]="standing",[4]="fighting",[5]="fighting",[8]="fighting",[9]="resting",[10]="sitting",[11]="sleeping"}
+	-- Aardwolf char.status values
+	local names = {[1]="login",[2]="motd",[3]="standing",[4]="AFK",[5]="in note",[6]="building",[7]="paged",
+		[8]="fighting",[9]="sleeping",[11]="resting/sitting",[12]="running"}
 	if s == nil then return "nil" end
 	return tostring(s).." ("..(names[s] or "other/not castable")..")"
 end
@@ -3068,6 +3303,9 @@ function hspDiag()
 		end
 		if r.suspendOnVis then
 			hspDiagLine("paused by vis     ", Spellups["GL"][r.key.."_suspended"])
+		end
+		if r.upFlag then
+			hspDiagLine("up (game text)    ", Spellups["GL"][r.upFlag])
 		end
 		if r.autoOnRace then
 			hspDiagLine("chosen by you     ", Spellups["GL"][r.key.."_userset"] == true)
@@ -3859,6 +4097,7 @@ function hspdied()
 		Spellups["GL"][r.pending] = false
 		r.healat = nil
 		r.blockedRoom = nil
+		if r.upFlag ~= nil then Spellups["GL"][r.upFlag] = false end -- dying ends it
 	end
 	Spellups["QS"] = {}
 	-- The affoff burst for every affect we just lost arrives AFTER this trigger, and
@@ -4448,6 +4687,563 @@ function hspsetprophecy(str)
 	end
 end
 
+----------------------------------------------------------------------------------------------------
+--  Special Affects Tracker miniwindow (hsp miniwin)
+--  One row per entry: name, status, mode. Window mechanics follow activity_tracker.xml, including
+--  its two paid-for fixes: corner modes 1-3 are stretch modes (default to 6 = top-right, and use
+--  mode 0 + flag 2 once dragged), and an explicit z-order so other plugins' windows cannot cover it.
+--  Everything lives in the global table hspmw so it adds nothing to the chunk's local count.
+----------------------------------------------------------------------------------------------------
+hspmw = {
+	win = "HSP_SpecialAffects",
+	fid = "hspf",
+	title = "Special Affects Tracker",
+	pad = 4, gap = 8, grip = 10, zorder = 200,
+	lineh = 16, titleh = 20,      -- real values come from the font in hspmwRegisterFont
+	w = 0, h = 0,                 -- size the window currently has
+	fitw = 0,                     -- narrowest width that shows every column
+	ready = false,
+	dragging = false, dragat = 0, -- a drag/resize gesture is in progress
+	sig = nil,                    -- layout the current hotspots were built for
+	startx = 0, starty = 0, origx = 0, origy = 0,
+	-- MUSHclient colours are BGR integers
+	bg = 0x121212, titlebg = 0x2D1E1E, text = 0xC8C8C8, gripcol = 0x707070,
+	green = 0x00FF00, red = 0x0000FF, yellow = 0x00FFFF, cyan = 0xFFFF00, darkcyan = 0x808000,
+	sizes = {6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20},
+	fonts = {"Courier New", "Fixedsys", "Lucida Console", "Consolas"},
+}
+
+-- Sanctuary first, then every tracked skill in table order.
+function hspmwEntries()
+	local list = {{key = "sanctuary", label = "Sanctuary"}}
+	for _,r in ipairs(recoverySkills) do
+		list[#list + 1] = {key = r.key, label = r.label, r = r}
+	end
+	return list
+end
+
+-- Pure test of a skill's class/race gate against the current character. rsClassCheck is not
+-- used here: it switches the setting off, which drawing must never do.
+function hspmwGateFits(r)
+	if r.class ~= nil and not classCheck(r.class) then return false end
+	if r.race ~= nil then
+		-- no race from GMCP yet means allow, same leniency as rsClassCheck
+		local race = gmcp("char.base.race")
+		if type(race) == "string" and race ~= "" and string.lower(race) ~= string.lower(r.race) then
+			return false
+		end
+	end
+	return true
+end
+
+-- The user's explicit choice wins; otherwise sanctuary always, and a skill when its gate fits.
+function hspmwShown(e)
+	local v = Spellups["MW"]["show"][e.key]
+	if v == true or v == false then return v end
+	if e.r == nil then return true end
+	return hspmwGateFits(e.r)
+end
+
+-- 4985 -> 1h23m5s, 125 -> 2m5s, 5 -> 5s
+function hspmwFmtTime(s)
+	local h = math.floor(s / 3600)
+	local m = math.floor((s % 3600) / 60)
+	local sec = s % 60
+	if h > 0 then return h.."h"..m.."m"..sec.."s" end
+	if m > 0 then return m.."m"..sec.."s" end
+	return sec.."s"
+end
+
+-- active / time left / cooldown / inactive. rc is the recovery group (nil = none).
+function hspmwStatusOf(active, rc)
+	if active then return "active", hspmw.green end
+	if rc ~= nil and hspRecoveryActive(rc) then
+		local exp = tonumber(Spellups["RT"]["recexpires"][rc])
+		local left = exp and math.floor(exp - os.time()) or nil
+		if left ~= nil and left > 0 then return hspmwFmtTime(left), hspmw.yellow end
+		return "cooldown", hspmw.yellow
+	end
+	return "inactive", hspmw.red
+end
+
+function hspmwStatus(e)
+	if e.r ~= nil then
+		local sn = rsSn(e.r)
+		if sn == nil then return "inactive", hspmw.red end
+		return hspmwStatusOf(rsIsUp(e.r), rsRc(e.r))
+	end
+	local rc = nil
+	local entry = Spellups["AS"]["list"][71]
+	if entry ~= nil then
+		rc = tonumber(entry["recovery"])
+		if rc == -1 then rc = nil end
+	end
+	-- the aura covering us counts as sanctuary being up
+	local active = hspAffectActive(71) or Spellups["GL"]["aurastate"] == "worn"
+	return hspmwStatusOf(active, rc)
+end
+
+function hspmwMode(e)
+	local hs = hspmw
+	local off = Spellups["GL"]["disabled"] == "yes"
+	if e.r ~= nil then
+		if not off and rsActive(e.r) and hspmwGateFits(e.r) and rsUsable(e.r) then
+			return "auto", hs.cyan
+		end
+		return "manual", hs.darkcyan
+	end
+	if not off and sancAuraReady() then return "autoaura", hs.cyan end
+	if not off and sancSpellKnown() and not contains(Spellups["EX"]["noAuto"] or {}, 71) then
+		return "auto", hs.cyan
+	end
+	return "manual", hs.darkcyan
+end
+
+function hspmwRegisterFont()
+	local hs, mw = hspmw, Spellups["MW"]
+	WindowFont(hs.win, hs.fid, mw.font, tonumber(mw.size) or 9, false, false, false, false, 0, 0)
+	hs.lineh = (tonumber(WindowFontInfo(hs.win, hs.fid, 1)) or 14) + 2
+	hs.titleh = hs.lineh + 4
+end
+
+-- Height that shows n whole rows
+function hspmwHeightFor(n)
+	return hspmw.titleh + 2 + n * hspmw.lineh + 4
+end
+
+-- Rows to show, column positions, and the window size (0 in w/h = fit the contents).
+function hspmwLayout()
+	local hs, mw = hspmw, Spellups["MW"]
+	local win, fid = hs.win, hs.fid
+	local rows, namew = {}, 0
+	for _,e in ipairs(hspmwEntries()) do
+		if hspmwShown(e) then
+			rows[#rows + 1] = e
+			namew = math.max(namew, WindowTextWidth(win, fid, e.label))
+		end
+	end
+	-- widest text each column can ever hold, so the columns do not jump around
+	local statw = math.max(WindowTextWidth(win, fid, "inactive"), WindowTextWidth(win, fid, "cooldown"),
+		WindowTextWidth(win, fid, "23h59m59s"))
+	local modew = math.max(WindowTextWidth(win, fid, "autoaura"), WindowTextWidth(win, fid, "manual"))
+	local x2 = hs.pad + namew + hs.gap
+	local x3 = x2 + statw + hs.gap
+	local fitw = math.max(x3 + modew + hs.pad,
+		WindowTextWidth(win, fid, hs.title) + WindowTextWidth(win, fid, "x") + hs.pad * 3)
+	local w = tonumber(mw.w) or 0
+	if w <= 0 then w = fitw else w = math.max(w, fitw) end
+	local h = tonumber(mw.h) or 0
+	if h <= 0 then h = hspmwHeightFor(#rows) end
+	local fits = math.max(0, math.floor((h - hs.titleh - 2 - 4) / hs.lineh))
+	return {rows = rows, x1 = hs.pad, x2 = x2, x3 = x3, w = w, h = h, fitw = fitw,
+		shown = math.min(#rows, fits)}
+end
+
+-- (Re)create the window at the saved position. Always creates fresh, so it is safe to call
+-- again after a reset or a plugin re-enable.
+function hspmwSetup()
+	local hs, mw = hspmw, Spellups["MW"]
+	-- Once dragged (pos 0) the saved left/top need flag 2 (create_absolute_location); without it
+	-- mode 0 means "stretch to the output view" and the window jumps back on every restart.
+	local flags = 0
+	if mw.pos == 0 then flags = 2 end
+	WindowCreate(hs.win, mw.left, mw.top, 100, 50, mw.pos, flags, hs.bg)
+	-- Windows draw by z-order, then by name; without this other plugins' windows cover it.
+	WindowSetZOrder(hs.win, hs.zorder)
+	hspmwRegisterFont()
+	local lay = hspmwLayout()
+	WindowResize(hs.win, lay.w, lay.h, hs.bg)
+	hs.w, hs.h, hs.fitw = lay.w, lay.h, lay.fitw
+	if mw.pos == 0 then
+		-- Pull it back into view if the client got smaller since it was saved. Skipped when the
+		-- output view is not sized yet (reports 0).
+		local vw, vh = tonumber(GetInfo(281)) or 0, tonumber(GetInfo(280)) or 0
+		if vw > 0 and vh > 0 then
+			mw.left = math.max(0, math.min(tonumber(mw.left) or 0, vw - lay.w))
+			mw.top = math.max(0, math.min(tonumber(mw.top) or 0, vh - hs.titleh))
+			WindowPosition(hs.win, mw.left, mw.top, 0, 2)
+		end
+	end
+	hs.dragging = false
+	hs.sig = nil
+	hs.ready = true
+	WindowShow(hs.win, true)
+end
+
+-- Hotspot ids are fixed (title, close, body, row:<key>, resize). They never overlap, because
+-- MUSHclient picks between overlapping hotspots by id order, not by which was added last.
+function hspmwHotspots(lay)
+	local hs = hspmw
+	local win, w, h = hs.win, lay.w, lay.h
+	local closew = WindowTextWidth(win, hs.fid, "x") + hs.pad * 2
+	WindowDeleteAllHotspots(win)
+	-- Signature: (win, id, left, top, right, bottom, MouseOver, CancelMouseOver, MouseDown,
+	--             CancelMouseDown, MouseUp, TooltipText, Cursor, Flags)
+	WindowAddHotspot(win, "title", 0, 0, w - closew, hs.titleh,
+		"", "", "hspmw_mousedown", "", "hspmw_title_up", "Drag to move, right-click for options", 10, 0)
+	WindowDragHandler(win, "title", "hspmw_drag", "hspmw_drop", 0)
+	WindowAddHotspot(win, "close", w - closew, 0, w, hs.titleh,
+		"", "", "", "", "hspmw_close_up", "Hide window", 1, 0)
+	local y = hs.titleh + 2
+	for i = 1, lay.shown do
+		local e = lay.rows[i]
+		local top = (i == 1) and hs.titleh or y
+		-- the last row stops short of the resize grip
+		local right = (y + hs.lineh > h - hs.grip) and (w - hs.grip) or w
+		WindowAddHotspot(win, "row:"..e.key, 0, top, right, y + hs.lineh,
+			"", "", "", "", "hspmw_row_up", "Right-click for options", 0, 0)
+		y = y + hs.lineh
+	end
+	-- body = whatever is left under the rows
+	local btop = math.min(y, h - 1)
+	WindowAddHotspot(win, "body", 0, btop, w - hs.grip, h,
+		"", "", "", "", "hspmw_body_up", "Right-click for options", 0, 0)
+	WindowAddHotspot(win, "resize", w - hs.grip, h - hs.grip, w, h,
+		"", "", "hspmw_resize_down", "", "hspmw_resize_up", "Drag to resize", 6, 0)
+	WindowDragHandler(win, "resize", "hspmw_resize_drag", "hspmw_resize_drop", 0)
+end
+
+-- Redraw everything. Global because it is also the 1 s timer's script.
+function mwDraw()
+	local mw = Spellups ~= nil and Spellups["MW"] or nil
+	if mw == nil or mw.enabled ~= "yes" then return end
+	local hs = hspmw
+	if not hs.ready then hspmwSetup() end
+	-- a drag whose release never reached us must not block hotspot rebuilds forever
+	if hs.dragging and os.time() - hs.dragat > 30 then hs.dragging = false end
+	local win, fid = hs.win, hs.fid
+	local lay = hspmwLayout()
+	hs.fitw = lay.fitw
+	if lay.w ~= hs.w or lay.h ~= hs.h then
+		WindowResize(win, lay.w, lay.h, hs.bg)
+		hs.w, hs.h = lay.w, lay.h
+	end
+	local w, h = lay.w, lay.h
+
+	WindowRectOp(win, 2, 0, 0, w, h, hs.bg)
+	WindowRectOp(win, 2, 0, 0, w, hs.titleh, hs.titlebg)
+	local xw = WindowTextWidth(win, fid, "x")
+	WindowText(win, fid, hs.title, hs.pad, 2, w - xw - hs.pad * 2, hs.titleh, hs.text)
+	WindowText(win, fid, "x", w - xw - hs.pad, 2, w, hs.titleh, hs.text)
+
+	local y = hs.titleh + 2
+	for i = 1, lay.shown do
+		local e = lay.rows[i]
+		local st, stc = hspmwStatus(e)
+		local md, mdc = hspmwMode(e)
+		local ncol = tonumber(mw.colors[e.key]) or hs.text
+		-- exactly three WindowText calls per row, all at the same top
+		WindowText(win, fid, e.label, lay.x1, y, lay.x2 - 1, y + hs.lineh, ncol)
+		WindowText(win, fid, st, lay.x2, y, lay.x3 - 1, y + hs.lineh, stc)
+		WindowText(win, fid, md, lay.x3, y, w, y + hs.lineh, mdc)
+		y = y + hs.lineh
+	end
+
+	-- resize grip: diagonal strokes in the bottom-right corner (lines only, no text)
+	for k = 3, 9, 3 do
+		WindowLine(win, w - k - 1, h - 1, w - 1, h - k - 1, hs.gripcol, 0, 1)
+	end
+
+	-- Hotspots only change with the layout. Rebuilding them every second would delete the one a
+	-- click or drag is in the middle of, and never while a resize drag is running.
+	local keys = {}
+	for i = 1, lay.shown do keys[i] = lay.rows[i].key end
+	local sig = w..","..h..","..hs.lineh..","..hs.titleh..":"..table.concat(keys, ",")
+	if sig ~= hs.sig and not hs.dragging then
+		hspmwHotspots(lay)
+		hs.sig = sig
+	end
+end
+
+function hspmwTimerStart()
+	AddTimer("HSPmwTick", 0, 0, 1, "", timer_flag.Enabled + timer_flag.Replace + timer_flag.Temporary, "mwDraw")
+end
+
+-- Hide and stop drawing; leaves the saved enabled flag alone (OnPluginDisable uses this).
+function hspmwStop()
+	WindowShow(hspmw.win, false)
+	DeleteTimer("HSPmwTick")
+end
+
+-- Show it again after a (re)load if it was left on.
+function hspmwResume()
+	local mw = Spellups["MW"]
+	if mw == nil or mw.enabled ~= "yes" then return end
+	hspmwSetup()
+	mwDraw()
+	hspmwTimerStart()
+end
+
+function hspmwHide()
+	Spellups["MW"]["enabled"] = "no"
+	hspmwStop()
+	SaveState()
+end
+
+-- ---------------------------------------------------------------- mouse handling
+-- Right button = flags bit 0x20. Menus open on mouse-up only, so one click shows one menu.
+-- The Aardwolf client's "lock layout" (owned by its aard_layout plugin). The client's own
+-- windows refuse to move or resize while it is on, so this one does too.
+function hspmwLocked()
+	return GetPluginVariable("c293f9e7f04dde889f65cb90", "lock_down_miniwindows") == "1"
+end
+
+function hspmw_mousedown(flags, hotspot_id)
+	local hs = hspmw
+	if bit.band(flags, 0x20) ~= 0 then return end
+	-- clicking the window brings it back to the front, locked or not
+	WindowSetZOrder(hs.win, hs.zorder)
+	-- Read the lock once per press and keep it until the next one, as movewindow does, so
+	-- toggling the lock mid-drag can't leave a half-finished move.
+	hs.locked = hspmwLocked()
+	if hs.locked then
+		hs.dragging = false
+		return
+	end
+	hs.startx, hs.starty = WindowInfo(hs.win, 14) or 0, WindowInfo(hs.win, 15) or 0
+	hs.origx, hs.origy = WindowInfo(hs.win, 10) or 0, WindowInfo(hs.win, 11) or 0
+	hs.dragging = true
+	hs.dragat = os.time()
+end
+
+function hspmw_title_up(flags, hotspot_id)
+	hspmw.dragging = false
+	if bit.band(flags, 0x20) ~= 0 then hspmwMenu(nil) end
+end
+
+function hspmw_body_up(flags, hotspot_id)
+	if bit.band(flags, 0x20) ~= 0 then hspmwMenu(nil) end
+end
+
+function hspmw_row_up(flags, hotspot_id)
+	if bit.band(flags, 0x20) ~= 0 then hspmwMenu(tostring(hotspot_id):match("^row:(.+)$")) end
+end
+
+function hspmw_close_up(flags, hotspot_id)
+	if bit.band(flags, 0x20) ~= 0 then return end
+	hspmwHide()
+	hadarprint("Special Affects window hidden, @Ghsp miniwin on@c brings it back","script")
+end
+
+function hspmw_drag(flags, hotspot_id)
+	local hs = hspmw
+	if hs.locked then return end
+	local posx, posy = WindowInfo(hs.win, 17), WindowInfo(hs.win, 18)
+	if not posx or not posy then return end
+	WindowPosition(hs.win, posx - hs.startx, posy - hs.starty, 0, 2)
+	-- X cursor while outside the output view, arrow while inside
+	local vw, vh = tonumber(GetInfo(281)) or 0, tonumber(GetInfo(280)) or 0
+	if vw > 0 and vh > 0 and (posx < 0 or posx > vw or posy < 0 or posy > vh) then
+		SetCursor(11)
+	else
+		SetCursor(10)
+	end
+end
+
+function hspmw_drop(flags, hotspot_id)
+	local hs, mw = hspmw, Spellups["MW"]
+	-- locked: nothing moved, and the corner anchoring must not be converted to absolute
+	if hs.locked then return end
+	local newx, newy = WindowInfo(hs.win, 17), WindowInfo(hs.win, 18)
+	local vw, vh = tonumber(GetInfo(281)) or 0, tonumber(GetInfo(280)) or 0
+	-- Don't let it be dropped out of view: put it back where the drag started
+	if newx and newy and vw > 0 and vh > 0 and (newx < 0 or newx > vw or newy < 0 or newy > vh) then
+		WindowPosition(hs.win, hs.origx, hs.origy, 0, 2)
+	end
+	mw.left = WindowInfo(hs.win, 10) or mw.left
+	mw.top = WindowInfo(hs.win, 11) or mw.top
+	mw.pos = 0 -- mode 0 + flag 2 from now on; modes 1-3 stretch
+	hs.dragging = false
+	SaveState()
+end
+
+function hspmw_resize_down(flags, hotspot_id)
+	local hs, mw = hspmw, Spellups["MW"]
+	hspmw_mousedown(flags, hotspot_id)
+	-- A window anchored to a corner (mode 6) would grow away from the mouse; pin it where it is.
+	if mw.pos ~= 0 and hs.dragging then
+		mw.left, mw.top, mw.pos = hs.origx, hs.origy, 0
+		WindowPosition(hs.win, mw.left, mw.top, 0, 2)
+	end
+end
+
+function hspmw_resize_up(flags, hotspot_id)
+	hspmw.dragging = false
+end
+
+function hspmw_resize_drag(flags, hotspot_id)
+	local hs, mw = hspmw, Spellups["MW"]
+	if hs.locked then return end
+	local posx, posy = WindowInfo(hs.win, 17), WindowInfo(hs.win, 18)
+	if not posx or not posy then return end
+	-- Width: free-form, never narrower than the columns, never past the view
+	local neww = math.max(hs.fitw, posx - hs.origx)
+	local vw = tonumber(GetInfo(281)) or 0
+	if vw > 0 then neww = math.max(hs.fitw, math.min(neww, vw - hs.origx)) end
+	-- Height: snapped to whole rows
+	local n = math.max(1, math.floor((posy - hs.origy - hs.titleh - 2) / hs.lineh))
+	local newh = hspmwHeightFor(n)
+	if neww == mw.w and newh == mw.h then return end
+	mw.w, mw.h = neww, newh
+	-- Redraw only: mwDraw skips the hotspot rebuild while dragging, which would delete the
+	-- "resize" hotspot mid-drag and abort the gesture.
+	mwDraw()
+end
+
+function hspmw_resize_drop(flags, hotspot_id)
+	hspmw.dragging = false
+	if hspmw.locked then return end
+	mwDraw() -- moves the hotspots to the new corner
+	SaveState()
+end
+
+-- ---------------------------------------------------------------- menu
+-- rowkey: set when opened from a row, which adds "Colour for <label>..." at the top.
+-- Labels are non-numeric and unique, so a returned label can never be mistaken for an index.
+function hspmwMenu(rowkey)
+	local hs, mw = hspmw, Spellups["MW"]
+	local ents = hspmwEntries()
+	local items, parts = {}, {}
+	local function leaf(it, checked)
+		items[#items + 1] = it
+		parts[#parts + 1] = (checked and "+" or "")..it.label
+	end
+
+	if rowkey ~= nil then
+		for _,e in ipairs(ents) do
+			if e.key == rowkey then
+				leaf({kind = "colour", key = e.key, label = "Colour for "..e.label.."..."})
+				parts[#parts + 1] = "-"
+			end
+		end
+	end
+	parts[#parts + 1] = ">Show on window"
+	for _,e in ipairs(ents) do
+		local shown = hspmwShown(e)
+		leaf({kind = "show", key = e.key, label = e.label, shown = shown}, shown)
+	end
+	parts[#parts + 1] = "<"
+	parts[#parts + 1] = ">Name colour"
+	for _,e in ipairs(ents) do
+		leaf({kind = "colour", key = e.key, label = e.label.."..."})
+	end
+	parts[#parts + 1] = "<"
+	parts[#parts + 1] = ">Font"
+	leaf({kind = "fontpick", label = "Choose font..."})
+	parts[#parts + 1] = ">Quick size"
+	for _,sz in ipairs(hs.sizes) do
+		leaf({kind = "size", val = sz, label = "Size "..sz}, sz == tonumber(mw.size))
+	end
+	parts[#parts + 1] = "<"
+	parts[#parts + 1] = ">Quick font"
+	for _,ft in ipairs(hs.fonts) do
+		leaf({kind = "font", val = ft, label = ft}, ft == mw.font)
+	end
+	parts[#parts + 1] = "<"
+	parts[#parts + 1] = "<"
+	parts[#parts + 1] = "-"
+	leaf({kind = "resetlist", label = "Reset list to default"})
+	leaf({kind = "resetcolours", label = "Reset colours"})
+	leaf({kind = "hide", label = "Hide window"})
+
+	local result = WindowMenu(hs.win, WindowInfo(hs.win, 14) or 0, WindowInfo(hs.win, 15) or 0,
+		table.concat(parts, "|"))
+	if result == nil or result == "" then return end
+
+	-- Resolve by label text (a checked item may come back with its leading +), else a 1-based index.
+	local choice
+	local clean = tostring(result):gsub("^%+", "")
+	for _,it in ipairs(items) do
+		if it.label == clean then choice = it; break end
+	end
+	if choice == nil then
+		local n = tonumber(result)
+		if n and items[n] then choice = items[n] end
+	end
+	if choice == nil then return end
+	hspmwMenuApply(choice)
+end
+
+-- Keep the same number of visible rows across a font change: count them with the old
+-- metrics, re-measure, then size to match.
+function hspmwFontChanged()
+	local hs, mw = hspmw, Spellups["MW"]
+	local rows = nil
+	if (tonumber(mw.h) or 0) > 0 then
+		rows = math.max(1, math.floor((mw.h - hs.titleh - 2 - 4) / hs.lineh))
+	end
+	hspmwRegisterFont()
+	if rows ~= nil then mw.h = hspmwHeightFor(rows) end
+end
+
+function hspmwMenuApply(choice)
+	local hs, mw = hspmw, Spellups["MW"]
+	local fontchanged = false
+	local kind = choice.kind
+	if kind == "show" then
+		-- store the opposite of what is shown right now, whether that was a default or a choice
+		mw.show[choice.key] = not choice.shown
+	elseif kind == "colour" then
+		local col = PickColour(tonumber(mw.colors[choice.key]) or hs.text)
+		if col == nil or col == -1 then return end -- cancelled
+		mw.colors[choice.key] = col
+	elseif kind == "fontpick" then
+		-- the real Windows font dialog; nil when cancelled
+		local wanted = utils.fontpicker(mw.font, tonumber(mw.size) or 9)
+		if not wanted then return end
+		mw.font = wanted.name or mw.font
+		mw.size = wanted.size or mw.size
+		fontchanged = true
+	elseif kind == "size" then
+		mw.size = choice.val
+		fontchanged = true
+	elseif kind == "font" then
+		mw.font = choice.val
+		fontchanged = true
+	elseif kind == "resetlist" then
+		mw.show = {}
+	elseif kind == "resetcolours" then
+		mw.colors = {}
+	elseif kind == "hide" then
+		hspmwHide()
+		return
+	end
+	if fontchanged then hspmwFontChanged() end
+	mwDraw()
+	SaveState()
+end
+
+-- ---------------------------------------------------------------- hsp miniwin
+function hspMiniwin(rest)
+	local mw = Spellups["MW"]
+	local arg = string.lower(tostring(rest or ""):match("^%s*(%S*)") or "")
+	if arg == "on" then
+		mw.enabled = "yes"
+		hspmwSetup()
+		mwDraw()
+		hspmwTimerStart()
+		SaveState()
+		hadarprint("Special Affects window @GON@c, right-click it for options","script")
+	elseif arg == "off" then
+		hspmwHide()
+		hadarprint("Special Affects window @ROFF@w","script")
+	elseif arg == "reset" then
+		-- position, size and font only; the skill list and name colours are the user's choices
+		mw.pos, mw.left, mw.top, mw.w, mw.h = 6, 0, 0, 0, 0
+		mw.font, mw.size = "Courier New", 9
+		if mw.enabled == "yes" then
+			hspmwSetup()
+			mwDraw()
+			hspmwTimerStart()
+		end
+		SaveState()
+		hadarprint("Special Affects window position, size and font reset","script")
+	else
+		hadarprint("Special Affects window is "..(mw.enabled == "yes" and "@GON" or "@ROFF").."@c: "
+			.."@Ghsp miniwin on@c, @Goff@c, @Greset@c. See @Ghsp help miniwin@w","script")
+	end
+end
+
 function HadarHelp(str)
 	local arg, rest
 	
@@ -4558,6 +5354,20 @@ function HadarHelp(str)
 		hadarprint("@x086|                        @x208recovery cooldown clears (out of combat)      @x086|","helpfile2")
 		hadarprint("@x086| @x214hsp quickstab off    @x110- @x214Disables auto-recast of quickstab             @x086|","helpfile2")
 		hadarprint("@x086+----------------------------------------------------------------------+@w","helpfile2")
+	elseif arg == "miniwin" then
+		hadarprint("@x086+----------------------------@G[@CM@ciniwin @CH@celp@G]@x086----------------------------+@w","helpfile2")
+		hadarprint("@x086| @x214hsp miniwin            Shows whether the window is on                @x086|","helpfile2")
+		hadarprint("@x086| @x208hsp miniwin on|off     Shows or hides the Special Affects Tracker    @x086|","helpfile2")
+		hadarprint("@x086| @x214hsp miniwin reset      Puts position, size and font back to default  @x086|","helpfile2")
+		hadarprint("@x086| @x208                                                                     @x086|","helpfile2")
+		hadarprint("@x086| @x214One row each for sanctuary and the tracked skills: the status        @x086|","helpfile2")
+		hadarprint("@x086| @x208(active, time left, cooldown, inactive) and whether it is cast       @x086|","helpfile2")
+		hadarprint("@x086| @x214for you (auto, autoaura) or left to you (manual).                    @x086|","helpfile2")
+		hadarprint("@x086| @x208                                                                     @x086|","helpfile2")
+		hadarprint("@x086| @x214Right-click it to choose which skills show, their name colours       @x086|","helpfile2")
+		hadarprint("@x086| @x208and the font. Drag the title bar to move it, the bottom right        @x086|","helpfile2")
+		hadarprint("@x086| @x214corner to resize it, the x to hide it.                               @x086|","helpfile2")
+		hadarprint("@x086+----------------------------------------------------------------------+@w","helpfile2")
 	elseif arg == "eye" then
 		hadarprint("@x086+----------------------------@G[@CE@cye @CH@celp @CF@ciles@G]@x086--------------------------+@w","helpfile2")
 		hadarprint("@x086| @x214hsp eye             @x110- @x214Shows you all your current settings            @x086|","helpfile2")
@@ -4592,6 +5402,7 @@ function HadarHelp(str)
 		hadarprint("@x086| @x214hsp spriteinvis on|off   @x110- @x214Racial invis upkeep (auto for Sprites)       @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp desecration on|off   @x110- @x208Keep desecration up (Harmer)                 @x086|@w","helpfile")
 		hadarprint("@x086| @x214dese                     @x110- @x214Toggle hsp desecration on/off                @x086|@w","helpfile")
+		hadarprint("@x086| @x208hsp miniwin on|off|reset @x110- @x208Special Affects window (see help)            @x086|@w","helpfile")
 		hadarprint("@x086| @x208hsp autoaura <command>   @x110- @x208Has multiple commands, they are:             @x086|@w","helpfile")
 		hadarprint("@x086|                           @x208 On  @x110-@x214 enables wearing aura in combat         @x086|@w","helpfile")
 		hadarprint("@x086|                           @x208 Off @x110-@x214 diables wearing aura in combat         @x086|@w","helpfile")
@@ -4628,6 +5439,7 @@ function HadarHelp(str)
 		hadarprint("@x086|                              @x214hsp help shadow                             @x086|@w","helpfile")
 		hadarprint("@x086|                              @x208hsp help spriteinvis                        @x086|@w","helpfile")
 		hadarprint("@x086|                              @x214hsp help desecration                        @x086|@w","helpfile")
+		hadarprint("@x086|                              @x208hsp help miniwin                           @x086|@w","helpfile")
 		hadarprint("@x086+-------------------------------------------------------------------------+@w","helpfile")
 	end
 end
